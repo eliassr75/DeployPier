@@ -10,9 +10,7 @@ import (
 
 func TestInstallCreatesLaravelHookFilesAndSnippets(t *testing.T) {
 	projectRoot := t.TempDir()
-	mustWrite(t, filepath.Join(projectRoot, "artisan"), "php")
-	mustWrite(t, filepath.Join(projectRoot, "composer.json"), "{}")
-	mustWrite(t, filepath.Join(projectRoot, "routes", "api.php"), "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n")
+	seedLaravelProject(t, projectRoot, false)
 	mustWrite(t, filepath.Join(projectRoot, ".env.example"), "APP_NAME=Laravel\n")
 
 	installer := NewLaravelHookInstaller()
@@ -32,10 +30,16 @@ func TestInstallCreatesLaravelHookFilesAndSnippets(t *testing.T) {
 	assertExists(t, filepath.Join(projectRoot, "config", "deploypier.php"))
 	assertExists(t, filepath.Join(projectRoot, "app", "Services", "Deploy", "DeployHookReceiverService.php"))
 	assertExists(t, filepath.Join(projectRoot, "database", "migrations", "2026_07_14_120000_create_deploy_hook_executions_table.php"))
+	assertExists(t, filepath.Join(projectRoot, "routes", "api.php"))
 
 	routeContent := mustRead(t, filepath.Join(projectRoot, "routes", "api.php"))
 	if !strings.Contains(routeContent, "internal.deploy.receive") {
 		t.Fatalf("expected route snippet to be appended")
+	}
+
+	bootstrapContent := mustRead(t, filepath.Join(projectRoot, "bootstrap", "app.php"))
+	if !strings.Contains(bootstrapContent, "api: __DIR__.'/../routes/api.php'") {
+		t.Fatalf("expected bootstrap/app.php to register routes/api.php")
 	}
 
 	envContent := mustRead(t, filepath.Join(projectRoot, ".env.example"))
@@ -55,9 +59,7 @@ func TestInstallFailsWhenProjectIsNotLaravel(t *testing.T) {
 
 func TestInstallLocawebBootstrapCreatesScripts(t *testing.T) {
 	projectRoot := t.TempDir()
-	mustWrite(t, filepath.Join(projectRoot, "artisan"), "php")
-	mustWrite(t, filepath.Join(projectRoot, "composer.json"), "{}")
-	mustWrite(t, filepath.Join(projectRoot, "routes", "api.php"), "<?php\n")
+	seedLaravelProject(t, projectRoot, false)
 
 	installer := NewLocawebBootstrapInstaller()
 	created, err := installer.Install(projectRoot, "myftpuser", false)
@@ -82,9 +84,7 @@ func TestInstallLocawebBootstrapCreatesScripts(t *testing.T) {
 
 func TestInitLocawebCreatesDeployConfigFiles(t *testing.T) {
 	projectRoot := t.TempDir()
-	mustWrite(t, filepath.Join(projectRoot, "artisan"), "php")
-	mustWrite(t, filepath.Join(projectRoot, "composer.json"), "{}")
-	mustWrite(t, filepath.Join(projectRoot, "routes", "api.php"), "<?php\n")
+	seedLaravelProject(t, projectRoot, false)
 
 	initializer := NewLocawebConfigInitializer()
 	created, err := initializer.Install(projectRoot, "myftpuser", false)
@@ -113,6 +113,57 @@ func TestInitLocawebCreatesDeployConfigFiles(t *testing.T) {
 	if !strings.Contains(indexExample, ".deploypier/current.txt") {
 		t.Fatalf("expected public index example to use current pointer")
 	}
+}
+
+func TestInstallReusesExistingAPIRoutesFileAndBootstrapMapping(t *testing.T) {
+	projectRoot := t.TempDir()
+	seedLaravelProject(t, projectRoot, true)
+
+	installer := NewLaravelHookInstaller()
+	installer.Now = func() time.Time {
+		return time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	}
+
+	if _, err := installer.Install(projectRoot, false); err != nil {
+		t.Fatalf("install scaffold: %v", err)
+	}
+
+	bootstrapContent := mustRead(t, filepath.Join(projectRoot, "bootstrap", "app.php"))
+	if strings.Count(bootstrapContent, "routes/api.php") != 1 {
+		t.Fatalf("expected bootstrap/app.php to keep a single api routing entry")
+	}
+}
+
+func seedLaravelProject(t *testing.T, projectRoot string, withAPI bool) {
+	t.Helper()
+	mustWrite(t, filepath.Join(projectRoot, "artisan"), "php")
+	mustWrite(t, filepath.Join(projectRoot, "composer.json"), "{}")
+
+	bootstrap := `<?php
+
+use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(
+        web: __DIR__.'/../routes/web.php',
+        commands: __DIR__.'/../routes/console.php',
+        health: '/up',
+    )
+    ->withMiddleware(function (Middleware $middleware): void {
+        //
+    })
+    ->withExceptions(function (Exceptions $exceptions): void {
+        //
+    })->create();
+`
+	if withAPI {
+		bootstrap = strings.Replace(bootstrap, "commands: __DIR__.'/../routes/console.php',", "api: __DIR__.'/../routes/api.php',\n        commands: __DIR__.'/../routes/console.php',", 1)
+		mustWrite(t, filepath.Join(projectRoot, "routes", "api.php"), "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n")
+	}
+
+	mustWrite(t, filepath.Join(projectRoot, "bootstrap", "app.php"), bootstrap)
 }
 
 func mustWrite(t *testing.T, path string, content string) {

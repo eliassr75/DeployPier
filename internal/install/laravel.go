@@ -61,10 +61,22 @@ func (i *LaravelHookInstaller) Install(projectRoot string, force bool) ([]string
 	}
 
 	routePath := filepath.Join(projectRoot, "routes", "api.php")
+	if changed, err := ensureFile(routePath, apiRoutesTemplate); err != nil {
+		return created, err
+	} else if changed {
+		created = append(created, routePath)
+	}
 	if changed, err := ensureContains(routePath, routeSnippet); err != nil {
 		return created, err
 	} else if changed {
 		created = append(created, routePath)
+	}
+
+	bootstrapPath := filepath.Join(projectRoot, "bootstrap", "app.php")
+	if changed, err := ensureLaravelAPIRouting(bootstrapPath); err != nil {
+		return created, err
+	} else if changed {
+		created = append(created, bootstrapPath)
 	}
 
 	envPath := filepath.Join(projectRoot, ".env.example")
@@ -83,7 +95,7 @@ func (i *LaravelHookInstaller) validateProject(projectRoot string) error {
 	required := []string{
 		filepath.Join(projectRoot, "artisan"),
 		filepath.Join(projectRoot, "composer.json"),
-		filepath.Join(projectRoot, "routes", "api.php"),
+		filepath.Join(projectRoot, "bootstrap", "app.php"),
 	}
 
 	for _, path := range required {
@@ -167,6 +179,22 @@ func writeFile(path string, content string, force bool) error {
 	return nil
 }
 
+func ensureFile(path string, content string) (bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return false, status.Wrap(status.KindInternal, "stat scaffold file", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, status.Wrap(status.KindInternal, "mkdir scaffold path", err)
+	}
+	if err := os.WriteFile(path, []byte(strings.TrimLeft(content, "\n")), 0o644); err != nil {
+		return false, status.Wrap(status.KindInternal, "write scaffold file", err)
+	}
+	return true, nil
+}
+
 func ensureContains(path string, snippet string) (bool, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -194,10 +222,60 @@ func ensureContains(path string, snippet string) (bool, error) {
 	return true, nil
 }
 
+func ensureLaravelAPIRouting(path string) (bool, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false, status.Wrap(status.KindInternal, "read bootstrap app", err)
+	}
+
+	content := string(raw)
+	if strings.Contains(content, "routes/api.php") || strings.Contains(content, "api: __DIR__.'/../routes/api.php'") {
+		return false, nil
+	}
+
+	replacement := "\n        api: __DIR__.'/../routes/api.php',"
+	anchors := []string{
+		"web: __DIR__.'/../routes/web.php',",
+		"commands: __DIR__.'/../routes/console.php',",
+		"health: '/up',",
+		"->withRouting(",
+	}
+
+	updated := content
+	changed := false
+	for _, anchor := range anchors {
+		if !strings.Contains(updated, anchor) {
+			continue
+		}
+		if anchor == "->withRouting(" {
+			updated = strings.Replace(updated, anchor, anchor+replacement, 1)
+		} else {
+			updated = strings.Replace(updated, anchor, anchor+replacement, 1)
+		}
+		changed = true
+		break
+	}
+
+	if !changed {
+		return false, status.Wrap(status.KindConflict, "update bootstrap app", fmt.Errorf("could not find a withRouting anchor inside %s", path))
+	}
+
+	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+		return false, status.Wrap(status.KindInternal, "write bootstrap app", err)
+	}
+	return true, nil
+}
+
 const routeSnippet = `
 Route::post('/internal/deploy/receive', \App\Http\Controllers\Internal\DeployReceiveController::class)
     ->middleware([\App\Http\Middleware\EnsureValidDeployHookSignature::class, 'throttle:20,1'])
     ->name('internal.deploy.receive');
+`
+
+const apiRoutesTemplate = `
+<?php
+
+use Illuminate\Support\Facades\Route;
 `
 
 const envSnippet = `
