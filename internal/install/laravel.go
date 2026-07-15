@@ -1162,7 +1162,7 @@ cat <<'EOF'
 Checklist manual Locaweb:
 1. Reabra a sessao shell ou rode: source "$BASH_PROFILE_PATH"
 2. Confirme que o link public_html/storage existe e aponta para storage/app/public.
-3. Adapte o public_html/index.php para ler .deploypier/current.txt antes do primeiro deploy.
+3. Rode deploypier doctor para criar e validar o bootstrap do public_html/index.php antes do primeiro deploy.
 
 EOF
 `, ftpUser, ftpUser)
@@ -1211,7 +1211,8 @@ func renderLocawebBootstrapDoc(ftpUser string) string {
 			"%[1]s%[1]s%[1]sbash\ncd /caminho/do/projeto\nbash scripts/locaweb/bootstrap-first-deploy.sh\n%[1]s%[1]s%[1]s\n\n"+
 			"## Observacao sobre o front controller\n\n"+
 			"No modo %[1]srelease-based%[1]s, o %[1]spublic_html/index.php%[1]s deve permanecer estavel e ler a release ativa a partir de %[1]s.deploypier/current.txt%[1]s.\n\n"+
-			"O DeployPier nao sobrescreve automaticamente um front controller ja customizado pelo projeto. A recomendacao e adaptar esse arquivo uma vez e manter a logica do ponteiro.\n\n"+
+			"Quando esse arquivo nao existir ainda, o %[1]sdeploypier doctor%[1]s cria um bootstrap remoto usando %[1]sruntime.app_root%[1]s e %[1]sruntime.current_pointer%[1]s.\n\n"+
+			"Se o front controller ja estiver customizado pelo projeto, o DeployPier nao o sobrescreve. Nesse caso, use o exemplo gerado como referencia e preserve a logica do ponteiro.\n\n"+
 			"O hook HTTP do Laravel nao e o lugar certo para esse bootstrap inicial porque:\n\n"+
 			"- alias de shell continuam sendo contexto do usuario, nao de um request HTTP;\n"+
 			"- %[1]scomposer install%[1]s ainda pode ser util em manutencao manual, antes da app estar operacional;\n"+
@@ -1257,14 +1258,18 @@ transport:
   host: ""
   port: 21
   user: %q
-  path: "/home/%s"
+  path: "/"
   known_hosts: ""
   allow_insecure: false
 
 remote:
-  app_root: "/home/%s/app"
-  public_root: "/home/%s/public_html"
+  app_root: "/app"
+  public_root: "/public_html"
   layout: "release-based"
+
+runtime:
+  app_root: "/home/%s/app"
+  current_pointer: "/home/%s/.deploypier/current.txt"
 
 post_deploy:
   mode: "manual"
@@ -1278,8 +1283,8 @@ state:
 
 activation:
   kind: "pointer"
-  current_pointer: "/home/%s/.deploypier/current.txt"
-`, projectName, ftpUser, ftpUser, ftpUser, ftpUser, ftpUser)
+  current_pointer: "/.deploypier/current.txt"
+`, projectName, ftpUser, ftpUser, ftpUser)
 }
 
 func renderLocawebDeployEnvExample(ftpUser string) string {
@@ -1290,8 +1295,10 @@ DEPLOY_USER=%s
 DEPLOY_PASSWORD=
 DEPLOY_PRIVATE_KEY=
 DEPLOYPIER_TRANSPORT_KNOWN_HOSTS=
-DEPLOY_REMOTE_APP_ROOT=/home/%s/app
-DEPLOY_REMOTE_PUBLIC_ROOT=/home/%s/public_html
+DEPLOY_REMOTE_APP_ROOT=/app
+DEPLOY_REMOTE_PUBLIC_ROOT=/public_html
+DEPLOY_RUNTIME_APP_ROOT=/home/%s/app
+DEPLOY_RUNTIME_CURRENT_POINTER=/home/%s/.deploypier/current.txt
 DEPLOY_HOOK_URL=
 DEPLOY_HOOK_KEY_ID=
 DEPLOY_HOOK_SECRET=
@@ -1302,6 +1309,7 @@ func renderLocawebPublicIndexExample(ftpUser string) string {
 	return fmt.Sprintf(`<?php
 declare(strict_types=1);
 
+// These paths are runtime filesystem paths used by PHP, not FTP transfer paths.
 $basePath = '/home/%s/app';
 $pointerFile = '/home/%s/.deploypier/current.txt';
 
@@ -1351,9 +1359,10 @@ func renderLocawebDeployGuide(projectName string, ftpUser string) string {
 			"    deploypier install-laravel-hook -project-root .\n\n"+
 			"2. Gere o bootstrap Locaweb:\n\n"+
 			"    deploypier install-locaweb-bootstrap -project-root . -ftp-user %s\n\n"+
-			"3. Adapte manualmente o public_html/index.php do projeto usando docs/deploypier-public-index.php.example como base.\n\n"+
-			"4. Execute o bootstrap inicial no shell da hospedagem.\n\n"+
-			"5. Copie .deploy.env.example para .deploy.env e preencha as variaveis locais.\n\n"+
+			"3. Execute o bootstrap inicial no shell da hospedagem.\n\n"+
+			"4. Copie .deploy.env.example para .deploy.env e preencha as variaveis locais.\n\n"+
+			"5. Inspecione os paths remotos sugeridos antes do primeiro push:\n\n"+
+			"    deploypier inspect-remote -config ./deploy.yml\n\n"+
 			"6. Rode:\n\n"+
 			"    deploypier doctor -config ./deploy.yml\n"+
 			"    deploypier plan -config ./deploy.yml\n\n"+
@@ -1361,8 +1370,13 @@ func renderLocawebDeployGuide(projectName string, ftpUser string) string {
 			"    deploypier push -config ./deploy.yml\n\n"+
 			"## Observacoes\n\n"+
 			"- O deploy assume que os arquivos publicos do Laravel ficam em public_html.\n"+
+			"- transport.path, remote.app_root, remote.public_root e activation.current_pointer sao paths de transporte usados pelo FTP/SFTP.\n"+
+			"- runtime.app_root e runtime.current_pointer sao paths absolutos usados pelo PHP dentro do public_html/index.php.\n"+
+			"- Se existir env.production ou .env.production na raiz local, o primeiro push usa esse arquivo apenas para semear o .env remoto quando a hospedagem ainda nao tiver um .env.\n"+
+			"- Quando o path real da conta diferir do padrao /home/<ftp_user>, o inspect-remote ajuda a sugerir os paths de transporte. Os paths de runtime ainda podem precisar de confirmacao manual.\n"+
 			"- O hook HTTP serve para pos-deploy da app ja operacional; bootstrap inicial continua no shell.\n"+
 			"- O public_html/index.php deve ser estavel e ler a release ativa a partir de .deploypier/current.txt.\n"+
+			"- Se o index.php remoto nao existir, deploypier doctor cria o bootstrap automaticamente.\n"+
 			"- O DeployPier nao sobrescreve automaticamente um index.php ja customizado pelo projeto.\n",
 		projectName, ftpUser, ftpUser,
 	)

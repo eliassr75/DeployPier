@@ -50,6 +50,13 @@ transport:
 	if cfg.Activation.CurrentPointer != expectedPointer {
 		t.Fatalf("unexpected activation pointer: %s", cfg.Activation.CurrentPointer)
 	}
+	expectedRuntimeAppRoot := filepath.Join(tempDir, ".deploypier", "remote", "app")
+	if cfg.Runtime.AppRoot != expectedRuntimeAppRoot {
+		t.Fatalf("unexpected runtime app root: %s", cfg.Runtime.AppRoot)
+	}
+	if cfg.Runtime.CurrentPointer != expectedPointer {
+		t.Fatalf("unexpected runtime pointer: %s", cfg.Runtime.CurrentPointer)
+	}
 }
 
 func TestLoadSupportsDeployEnvNames(t *testing.T) {
@@ -70,12 +77,14 @@ remote:
 	}
 
 	cfg, err := Load(configPath, map[string]string{
-		"DEPLOY_HOST":               "ftp.example.com",
-		"DEPLOY_PORT":               "2121",
-		"DEPLOY_USER":               "deploy-user",
-		"DEPLOY_REMOTE_APP_ROOT":    "/home/example/app",
-		"DEPLOY_REMOTE_PUBLIC_ROOT": "/home/example/public_html",
-		"DEPLOY_PASSWORD":           "secret",
+		"DEPLOY_HOST":                    "ftp.example.com",
+		"DEPLOY_PORT":                    "2121",
+		"DEPLOY_USER":                    "deploy-user",
+		"DEPLOY_REMOTE_APP_ROOT":         "/home/example/app",
+		"DEPLOY_REMOTE_PUBLIC_ROOT":      "/home/example/public_html",
+		"DEPLOY_RUNTIME_APP_ROOT":        "/srv/runtime/app",
+		"DEPLOY_RUNTIME_CURRENT_POINTER": "/srv/runtime/.deploypier/current.txt",
+		"DEPLOY_PASSWORD":                "secret",
 	}, tempDir)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
@@ -98,6 +107,12 @@ remote:
 	}
 	if cfg.Transport.Password != "secret" {
 		t.Fatalf("expected password to be loaded from env")
+	}
+	if cfg.Runtime.AppRoot != "/srv/runtime/app" {
+		t.Fatalf("unexpected runtime app root: %s", cfg.Runtime.AppRoot)
+	}
+	if cfg.Runtime.CurrentPointer != "/srv/runtime/.deploypier/current.txt" {
+		t.Fatalf("unexpected runtime pointer: %s", cfg.Runtime.CurrentPointer)
 	}
 }
 

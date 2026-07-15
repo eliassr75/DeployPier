@@ -22,6 +22,7 @@ type Config struct {
 	Release    ReleaseConfig    `yaml:"release"`
 	Transport  TransportConfig  `yaml:"transport"`
 	Remote     RemoteConfig     `yaml:"remote"`
+	Runtime    RuntimeConfig    `yaml:"runtime"`
 	PostDeploy PostDeployConfig `yaml:"post_deploy"`
 	State      StateConfig      `yaml:"state"`
 	Activation ActivationConfig `yaml:"activation"`
@@ -63,6 +64,11 @@ type RemoteConfig struct {
 	AppRoot    string `yaml:"app_root"`
 	PublicRoot string `yaml:"public_root"`
 	Layout     string `yaml:"layout"`
+}
+
+type RuntimeConfig struct {
+	AppRoot        string `yaml:"app_root"`
+	CurrentPointer string `yaml:"current_pointer"`
 }
 
 type PostDeployConfig struct {
@@ -149,6 +155,7 @@ func Load(path string, env map[string]string, cwd string) (Config, error) {
 
 	resolveRelativePaths(&cfg, baseDir)
 	applyEnvOverrides(&cfg, env, baseDir)
+	normalizeRuntime(&cfg)
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -184,6 +191,7 @@ func defaults(cwd string) Config {
 			PublicRoot: filepath.Join(baseStateDir, "remote", "public_html"),
 			Layout:     "release-based",
 		},
+		Runtime: RuntimeConfig{},
 		PostDeploy: PostDeployConfig{
 			Mode:       "skip",
 			HookURLEnv: "DEPLOY_HOOK_URL",
@@ -206,6 +214,8 @@ func resolveRelativePaths(cfg *Config, baseDir string) {
 	cfg.Transport.Path = resolvePath(baseDir, cfg.Transport.Path)
 	cfg.Remote.AppRoot = resolvePath(baseDir, cfg.Remote.AppRoot)
 	cfg.Remote.PublicRoot = resolvePath(baseDir, cfg.Remote.PublicRoot)
+	cfg.Runtime.AppRoot = resolvePath(baseDir, cfg.Runtime.AppRoot)
+	cfg.Runtime.CurrentPointer = resolvePath(baseDir, cfg.Runtime.CurrentPointer)
 	cfg.State.File = resolvePath(baseDir, cfg.State.File)
 	cfg.Activation.CurrentPointer = resolvePath(baseDir, cfg.Activation.CurrentPointer)
 }
@@ -284,6 +294,12 @@ func applyEnvOverrides(cfg *Config, env map[string]string, baseDir string) {
 	if value := firstNonEmpty(env, EnvPrefix+"REMOTE_LAYOUT", LegacyEnvPrefix+"REMOTE_LAYOUT"); value != "" {
 		cfg.Remote.Layout = value
 	}
+	if value := firstNonEmpty(env, EnvPrefix+"RUNTIME_APP_ROOT", LegacyEnvPrefix+"RUNTIME_APP_ROOT", "DEPLOY_RUNTIME_APP_ROOT"); value != "" {
+		cfg.Runtime.AppRoot = resolvePath(baseDir, value)
+	}
+	if value := firstNonEmpty(env, EnvPrefix+"RUNTIME_CURRENT_POINTER", LegacyEnvPrefix+"RUNTIME_CURRENT_POINTER", "DEPLOY_RUNTIME_CURRENT_POINTER"); value != "" {
+		cfg.Runtime.CurrentPointer = resolvePath(baseDir, value)
+	}
 	if value := firstNonEmpty(env, EnvPrefix+"POST_DEPLOY_MODE", LegacyEnvPrefix+"POST_DEPLOY_MODE"); value != "" {
 		cfg.PostDeploy.Mode = value
 	}
@@ -313,6 +329,15 @@ func applyEnvOverrides(cfg *Config, env map[string]string, baseDir string) {
 	}
 	if value := firstNonEmpty(env, EnvPrefix+"ACTIVATION_POINTER", LegacyEnvPrefix+"ACTIVATION_POINTER"); value != "" {
 		cfg.Activation.CurrentPointer = resolvePath(baseDir, value)
+	}
+}
+
+func normalizeRuntime(cfg *Config) {
+	if strings.TrimSpace(cfg.Runtime.AppRoot) == "" {
+		cfg.Runtime.AppRoot = cfg.Remote.AppRoot
+	}
+	if strings.TrimSpace(cfg.Runtime.CurrentPointer) == "" {
+		cfg.Runtime.CurrentPointer = cfg.Activation.CurrentPointer
 	}
 }
 
@@ -427,11 +452,17 @@ func (c Config) Validate() error {
 	if c.State.File == "" {
 		problems = append(problems, "state.file is required")
 	}
+	if c.Runtime.AppRoot == "" {
+		problems = append(problems, "runtime.app_root is required")
+	}
 	if c.Activation.Kind == "" {
 		problems = append(problems, "activation.kind is required")
 	}
 	if c.Activation.CurrentPointer == "" && c.Activation.Kind == "pointer" {
 		problems = append(problems, "activation.current_pointer is required for pointer activation")
+	}
+	if c.Runtime.CurrentPointer == "" && c.Activation.Kind == "pointer" {
+		problems = append(problems, "runtime.current_pointer is required for pointer activation")
 	}
 
 	for phase, hooks := range map[string][]HookSpec{

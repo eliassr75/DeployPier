@@ -58,6 +58,26 @@ type DoctorCheck struct {
 	Details string
 }
 
+type RemoteInspection struct {
+	Transport                string
+	CurrentDir               string
+	ConfiguredTransportPath  string
+	ResolvedTransportPath    string
+	ConfiguredRuntimeAppRoot string
+	ConfiguredRuntimePointer string
+	SuggestedTransportPath   string
+	SuggestedAppRoot         string
+	SuggestedPublicRoot      string
+	SuggestedCurrentPointer  string
+	SuggestedRuntimeAppRoot  string
+	SuggestedRuntimePointer  string
+	SuggestedBasePath        string
+	BasePathSource           string
+	PublicHTMLExists         bool
+	AppDirExists             bool
+	Notes                    []string
+}
+
 type PushResult struct {
 	ReleaseID      string
 	RemotePath     string
@@ -210,6 +230,102 @@ func (s *Service) Build(ctx context.Context) (build.Release, error) {
 	return release, nil
 }
 
+func (s *Service) InspectRemote(ctx context.Context) (RemoteInspection, error) {
+	inspection, err := s.transport.Inspect(ctx)
+	if err != nil {
+		return RemoteInspection{}, err
+	}
+
+	result := RemoteInspection{
+		Transport:                s.transport.Name(),
+		CurrentDir:               inspection.CurrentDir,
+		ConfiguredTransportPath:  s.cfg.Transport.Path,
+		ResolvedTransportPath:    inspection.ResolvedPath,
+		ConfiguredRuntimeAppRoot: s.cfg.Runtime.AppRoot,
+		ConfiguredRuntimePointer: s.cfg.Runtime.CurrentPointer,
+	}
+
+	candidates := uniqueNonEmpty(
+		canonicalRemoteCandidate(inspection.ResolvedPath),
+		canonicalRemoteCandidate(inspection.CurrentDir),
+		canonicalRemoteCandidate(s.cfg.Transport.Path),
+	)
+
+	bestBase := ""
+	bestSource := ""
+	bestScore := -1
+	bestPublic := false
+	bestApp := false
+
+	for _, candidate := range candidates {
+		score := 0
+		publicExists, _ := s.transport.Exists(ctx, joinServicePath(candidate, "public_html"))
+		appExists, _ := s.transport.Exists(ctx, joinServicePath(candidate, "app"))
+
+		if publicExists {
+			score += 3
+		}
+		if appExists {
+			score += 2
+		}
+		if candidate == canonicalRemoteCandidate(inspection.CurrentDir) {
+			score++
+		}
+
+		if score > bestScore {
+			bestScore = score
+			bestBase = candidate
+			bestPublic = publicExists
+			bestApp = appExists
+			switch candidate {
+			case canonicalRemoteCandidate(inspection.ResolvedPath):
+				bestSource = "resolved_transport_path"
+			case canonicalRemoteCandidate(inspection.CurrentDir):
+				bestSource = "current_dir"
+			default:
+				bestSource = "configured_transport_path"
+			}
+		}
+	}
+
+	if bestBase == "" {
+		bestBase = canonicalRemoteCandidate(s.cfg.Transport.Path)
+		bestSource = "configured_transport_path"
+	}
+
+	result.SuggestedBasePath = bestBase
+	result.BasePathSource = bestSource
+	result.PublicHTMLExists = bestPublic
+	result.AppDirExists = bestApp
+	result.SuggestedTransportPath = bestBase
+	if bestBase != "" {
+		result.SuggestedAppRoot = joinServicePath(bestBase, "app")
+		result.SuggestedPublicRoot = joinServicePath(bestBase, "public_html")
+		result.SuggestedCurrentPointer = joinServicePath(bestBase, ".deploypier", "current.txt")
+	}
+	if bestBase != "" && bestBase != "/" {
+		result.SuggestedRuntimeAppRoot = joinServicePath(bestBase, "app")
+		result.SuggestedRuntimePointer = joinServicePath(bestBase, ".deploypier", "current.txt")
+	} else {
+		result.Notes = append(result.Notes, "runtime php paths could not be inferred from the transport root alone; confirm the absolute account path before copying the public index example")
+	}
+
+	if !bestPublic {
+		result.Notes = append(result.Notes, "public_html was not confirmed under the suggested base path; confirm the real remote root in the hosting panel or via temporary SSH if needed")
+	}
+	if !bestApp {
+		result.Notes = append(result.Notes, "app directory was not found yet; this is expected before the first DeployPier push")
+	}
+	if strings.TrimSpace(inspection.CurrentDir) != "" && strings.TrimSpace(inspection.ResolvedPath) != "" && canonicalRemoteCandidate(inspection.CurrentDir) != canonicalRemoteCandidate(inspection.ResolvedPath) {
+		result.Notes = append(result.Notes, "the transport current directory differs from transport.path; review the suggested base path before persisting it")
+	}
+	if strings.TrimSpace(inspection.CurrentDir) == "" {
+		result.Notes = append(result.Notes, "remote current directory could not be determined; suggestions are based on the configured path only")
+	}
+
+	return result, nil
+}
+
 func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool) (PushResult, error) {
 	assessment, err := migrations.Assess(ctx, s.cfg.Project.Root)
 	if err != nil {
@@ -254,6 +370,9 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 		return result, err
 	}
 	if err := s.validateRemoteRelease(ctx, release, upload.RemotePath); err != nil {
+		return result, err
+	}
+	if err := s.ensureReleaseEnvironment(ctx, upload.RemotePath); err != nil {
 		return result, err
 	}
 	result.RemotePath = upload.RemotePath
@@ -446,6 +565,20 @@ func (s *Service) publicIndexCheck(ctx context.Context) DoctorCheck {
 		}
 	}
 	if !exists {
+		if s.shouldBootstrapPublicIndex() {
+			if err := s.bootstrapPublicIndex(ctx, indexPath); err != nil {
+				return DoctorCheck{
+					Name:    "public_index",
+					Report:  status.Classify(err),
+					Details: indexPath,
+				}
+			}
+			return DoctorCheck{
+				Name:    "public_index",
+				Report:  status.Report{Level: status.LevelOK, Code: "created", Message: "remote public index was missing and a DeployPier bootstrap index.php was created"},
+				Details: indexPath,
+			}
+		}
 		return DoctorCheck{
 			Name:    "public_index",
 			Report:  status.Report{Level: status.LevelWarn, Code: "missing", Message: "remote public index is missing; adapt it to DeployPier current pointer mode before the first activation"},
@@ -485,6 +618,129 @@ func (s *Service) publicIndexCheck(ctx context.Context) DoctorCheck {
 		Report:  status.Report{Level: status.LevelOK, Code: "ok", Message: "remote public index is compatible with current pointer mode"},
 		Details: indexPath,
 	}
+}
+
+func (s *Service) shouldBootstrapPublicIndex() bool {
+	return strings.EqualFold(strings.TrimSpace(s.cfg.Remote.Layout), "release-based") &&
+		strings.EqualFold(strings.TrimSpace(s.cfg.Activation.Kind), "pointer") &&
+		strings.TrimSpace(s.cfg.Runtime.AppRoot) != "" &&
+		strings.TrimSpace(s.cfg.Runtime.CurrentPointer) != ""
+}
+
+func (s *Service) bootstrapPublicIndex(ctx context.Context, indexPath string) error {
+	if err := s.transport.MkdirAll(ctx, serviceDir(indexPath)); err != nil {
+		return status.Wrap(status.KindInternal, "prepare remote public index directory", err)
+	}
+	if err := s.transport.WriteFile(ctx, indexPath, []byte(s.renderBootstrapPublicIndex())); err != nil {
+		return status.Wrap(status.KindInternal, "write remote public index", err)
+	}
+	return nil
+}
+
+func (s *Service) renderBootstrapPublicIndex() string {
+	return fmt.Sprintf(`<?php
+declare(strict_types=1);
+
+// Generated by DeployPier doctor for current-pointer activation.
+// Review the runtime paths below if the hosting account uses a different absolute PHP path.
+$basePath = '%s';
+$pointerFile = '%s';
+
+$releaseId = trim((string) @file_get_contents($pointerFile));
+
+if ($releaseId === '') {
+    http_response_code(503);
+    echo 'DeployPier: current release pointer is empty.';
+    exit(1);
+}
+
+$releaseRoot = $basePath.'/releases/'.$releaseId;
+$maintenance = $releaseRoot.'/storage/framework/maintenance.php';
+$autoload = $releaseRoot.'/vendor/autoload.php';
+$bootstrap = $releaseRoot.'/bootstrap/app.php';
+
+if (is_file($maintenance)) {
+    require $maintenance;
+}
+
+if (! is_file($autoload) || ! is_file($bootstrap)) {
+    http_response_code(503);
+    echo 'DeployPier: active release is incomplete.';
+    exit(1);
+}
+
+require $autoload;
+$app = require_once $bootstrap;
+$app->usePublicPath(__DIR__);
+
+return $app;
+`, phpSingleQuoted(s.cfg.Runtime.AppRoot), phpSingleQuoted(s.cfg.Runtime.CurrentPointer))
+}
+
+func phpSingleQuoted(value string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `'`, `\'`)
+	return replacer.Replace(value)
+}
+
+func (s *Service) ensureReleaseEnvironment(ctx context.Context, remoteReleasePath string) error {
+	releaseEnvPath := joinServicePath(remoteReleasePath, ".env")
+	releaseExists, err := s.transport.Exists(ctx, releaseEnvPath)
+	if err != nil {
+		return err
+	}
+	if releaseExists {
+		return nil
+	}
+
+	sharedEnvPath := s.sharedRemoteEnvPath()
+	sharedExists, err := s.transport.Exists(ctx, sharedEnvPath)
+	if err != nil {
+		return err
+	}
+
+	var envData []byte
+	if sharedExists {
+		envData, err = s.transport.ReadFile(ctx, sharedEnvPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		localEnvPath, localEnvData, ok, err := s.readLocalProductionEnv()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		envData = localEnvData
+		if err := s.transport.WriteFile(ctx, sharedEnvPath, envData); err != nil {
+			return status.Wrap(status.KindInternal, "seed shared remote .env from "+localEnvPath, err)
+		}
+	}
+
+	if err := s.transport.WriteFile(ctx, releaseEnvPath, envData); err != nil {
+		return status.Wrap(status.KindInternal, "write release .env", err)
+	}
+	return nil
+}
+
+func (s *Service) sharedRemoteEnvPath() string {
+	return joinServicePath(s.cfg.Transport.Path, ".env")
+}
+
+func (s *Service) readLocalProductionEnv() (string, []byte, bool, error) {
+	for _, candidate := range []string{"env.production", ".env.production"} {
+		localPath := filepath.Join(s.cfg.Project.Root, candidate)
+		data, err := os.ReadFile(localPath)
+		if err == nil {
+			return localPath, data, true, nil
+		}
+		if os.IsNotExist(err) {
+			continue
+		}
+		return "", nil, false, status.Wrap(status.KindInternal, "read local production env", err)
+	}
+	return "", nil, false, nil
 }
 
 func (s *Service) remoteReleasePath(releaseID string) string {
@@ -625,4 +881,33 @@ func gitCommand(ctx context.Context, dir string, args ...string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(output))
+}
+
+func canonicalRemoteCandidate(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	base := serviceBase(trimmed)
+	if base == "public_html" || base == "app" {
+		return serviceDir(trimmed)
+	}
+	return trimmed
+}
+
+func uniqueNonEmpty(values ...string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
 }

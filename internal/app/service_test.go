@@ -44,6 +44,7 @@ func (f *fakeBuilder) Load(ctx context.Context, cfg config.Config, releaseID str
 type fakeTransport struct {
 	uploaded []string
 	files    map[string][]byte
+	inspect  transport.Inspection
 }
 
 func (f *fakeTransport) Name() string {
@@ -53,6 +54,11 @@ func (f *fakeTransport) Name() string {
 func (f *fakeTransport) Probe(ctx context.Context) status.Report {
 	_ = ctx
 	return status.Report{Level: status.LevelOK, Code: "ok", Message: "ready"}
+}
+
+func (f *fakeTransport) Inspect(ctx context.Context) (transport.Inspection, error) {
+	_ = ctx
+	return f.inspect, nil
 }
 
 func (f *fakeTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string) (transport.UploadResult, error) {
@@ -150,8 +156,19 @@ func (f *fakeTransport) RemoveAll(ctx context.Context, remotePath string) error 
 
 func (f *fakeTransport) Exists(ctx context.Context, remotePath string) (bool, error) {
 	_ = ctx
-	_, ok := f.files[remotePath]
-	return ok, nil
+	if _, ok := f.files[remotePath]; ok {
+		return true, nil
+	}
+	prefix := remotePath
+	if !strings.HasSuffix(prefix, "/") && !strings.HasSuffix(prefix, `\`) {
+		prefix += "/"
+	}
+	for path := range f.files {
+		if strings.HasPrefix(path, prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type fakeActivator struct {
@@ -385,6 +402,146 @@ return new class {
 	}
 }
 
+func TestPushSeedsSharedRemoteEnvFromLocalEnvProduction(t *testing.T) {
+	tempDir := t.TempDir()
+	store := state.New(filepath.Join(tempDir, "state.json"))
+
+	release := build.Release{
+		ID:         "rel-env-1",
+		Path:       filepath.Join(tempDir, "releases", "rel-env-1"),
+		BundlePath: filepath.Join(tempDir, "bundle"),
+		Manifest: build.Manifest{
+			ReleaseID: "rel-env-1",
+		},
+	}
+	if err := store.RecordBuild(context.Background(), state.BuildRecord{
+		ReleaseID: release.ID,
+		Path:      release.Path,
+		BuiltAt:   "2026-07-15T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("record build: %v", err)
+	}
+
+	projectRoot := filepath.Join(tempDir, "project")
+	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, "env.production"), []byte("APP_ENV=production\nAPP_KEY=base64:test\n"), 0o644); err != nil {
+		t.Fatalf("write env.production: %v", err)
+	}
+
+	service := &Service{
+		cfg: config.Config{
+			Project: config.ProjectConfig{Root: projectRoot},
+			Transport: config.TransportConfig{
+				Path: "/",
+			},
+			Remote: config.RemoteConfig{
+				AppRoot: "/app",
+			},
+			PostDeploy: config.PostDeployConfig{
+				Mode: "skip",
+			},
+		},
+		builder:   &fakeBuilder{loadRelease: release},
+		store:     store,
+		transport: &fakeTransport{},
+		activator: &fakeActivator{},
+		hooks:     &fakeHooks{},
+		now:       func() time.Time { return time.Date(2026, 7, 15, 10, 5, 0, 0, time.UTC) },
+	}
+
+	result, err := service.Push(context.Background(), release.ID, true)
+	if err != nil {
+		t.Fatalf("push service: %v", err)
+	}
+	if result.RemotePath != "/app/releases/rel-env-1" {
+		t.Fatalf("unexpected remote path: %s", result.RemotePath)
+	}
+
+	transportImpl := service.transport.(*fakeTransport)
+	sharedEnv, ok := transportImpl.files["/.env"]
+	if !ok {
+		t.Fatalf("expected shared remote .env to be created")
+	}
+	releaseEnv, ok := transportImpl.files["/app/releases/rel-env-1/.env"]
+	if !ok {
+		t.Fatalf("expected release .env to be created")
+	}
+	if string(sharedEnv) != "APP_ENV=production\nAPP_KEY=base64:test\n" {
+		t.Fatalf("unexpected shared env content: %s", string(sharedEnv))
+	}
+	if string(releaseEnv) != string(sharedEnv) {
+		t.Fatalf("expected release env to match shared env")
+	}
+}
+
+func TestPushReusesExistingSharedRemoteEnv(t *testing.T) {
+	tempDir := t.TempDir()
+	store := state.New(filepath.Join(tempDir, "state.json"))
+
+	release := build.Release{
+		ID:         "rel-env-2",
+		Path:       filepath.Join(tempDir, "releases", "rel-env-2"),
+		BundlePath: filepath.Join(tempDir, "bundle"),
+		Manifest: build.Manifest{
+			ReleaseID: "rel-env-2",
+		},
+	}
+	if err := store.RecordBuild(context.Background(), state.BuildRecord{
+		ReleaseID: release.ID,
+		Path:      release.Path,
+		BuiltAt:   "2026-07-15T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("record build: %v", err)
+	}
+
+	projectRoot := filepath.Join(tempDir, "project")
+	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, "env.production"), []byte("LOCAL_ONLY=true\n"), 0o644); err != nil {
+		t.Fatalf("write env.production: %v", err)
+	}
+
+	transportImpl := &fakeTransport{
+		files: map[string][]byte{
+			"/.env": []byte("APP_ENV=staging\nAPP_KEY=base64:remote\n"),
+		},
+	}
+	service := &Service{
+		cfg: config.Config{
+			Project: config.ProjectConfig{Root: projectRoot},
+			Transport: config.TransportConfig{
+				Path: "/",
+			},
+			Remote: config.RemoteConfig{
+				AppRoot: "/app",
+			},
+			PostDeploy: config.PostDeployConfig{
+				Mode: "skip",
+			},
+		},
+		builder:   &fakeBuilder{loadRelease: release},
+		store:     store,
+		transport: transportImpl,
+		activator: &fakeActivator{},
+		hooks:     &fakeHooks{},
+		now:       func() time.Time { return time.Date(2026, 7, 15, 10, 5, 0, 0, time.UTC) },
+	}
+
+	if _, err := service.Push(context.Background(), release.ID, true); err != nil {
+		t.Fatalf("push service: %v", err)
+	}
+
+	if string(transportImpl.files["/.env"]) != "APP_ENV=staging\nAPP_KEY=base64:remote\n" {
+		t.Fatalf("expected remote shared env to be preserved")
+	}
+	if string(transportImpl.files["/app/releases/rel-env-2/.env"]) != "APP_ENV=staging\nAPP_KEY=base64:remote\n" {
+		t.Fatalf("expected release env to reuse remote shared env")
+	}
+}
+
 func TestDoctorWarnsWhenPublicIndexIsNotReadyForCurrentPointerMode(t *testing.T) {
 	transportImpl := &fakeTransport{
 		files: map[string][]byte{
@@ -415,6 +572,92 @@ func TestDoctorWarnsWhenPublicIndexIsNotReadyForCurrentPointerMode(t *testing.T)
 	}
 	if !strings.Contains(check.Report.Message, "current pointer mode") {
 		t.Fatalf("unexpected message: %s", check.Report.Message)
+	}
+}
+
+func TestDoctorCreatesBootstrapPublicIndexWhenMissing(t *testing.T) {
+	transportImpl := &fakeTransport{}
+	service := &Service{
+		cfg: config.Config{
+			Remote: config.RemoteConfig{
+				PublicRoot: "/remote/public_html",
+				Layout:     "release-based",
+			},
+			Runtime: config.RuntimeConfig{
+				AppRoot:        "/home/storage/demo/app",
+				CurrentPointer: "/home/storage/demo/.deploypier/current.txt",
+			},
+			Activation: config.ActivationConfig{
+				Kind:           "pointer",
+				CurrentPointer: "/remote/.deploypier/current.txt",
+			},
+		},
+		transport: transportImpl,
+		activator: &fakeActivator{},
+	}
+
+	checks, err := service.Doctor(context.Background())
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+
+	check := findDoctorCheck(t, checks, "public_index")
+	if check.Report.Level != status.LevelOK {
+		t.Fatalf("expected ok after bootstrap creation, got %s", check.Report.Level)
+	}
+	if check.Report.Code != "created" {
+		t.Fatalf("expected created code, got %s", check.Report.Code)
+	}
+
+	indexPath := "/remote/public_html/index.php"
+	raw, ok := transportImpl.files[indexPath]
+	if !ok {
+		t.Fatalf("expected bootstrap public index to be written")
+	}
+	content := string(raw)
+	if !strings.Contains(content, "/home/storage/demo/app") {
+		t.Fatalf("expected runtime app path in bootstrap index: %s", content)
+	}
+	if !strings.Contains(content, "/home/storage/demo/.deploypier/current.txt") {
+		t.Fatalf("expected runtime pointer path in bootstrap index: %s", content)
+	}
+	if !strings.Contains(content, "$app->usePublicPath(__DIR__);") {
+		t.Fatalf("expected usePublicPath in bootstrap index: %s", content)
+	}
+}
+
+func TestInspectRemoteSuggestsBasePathFromCurrentDir(t *testing.T) {
+	transportImpl := &fakeTransport{
+		inspect: transport.Inspection{
+			CurrentDir:   "/home/storage/b/ef/25/demo",
+			ResolvedPath: "/home/demo",
+		},
+		files: map[string][]byte{
+			"/home/storage/b/ef/25/demo/public_html/index.php": []byte("<?php"),
+		},
+	}
+	service := &Service{
+		cfg: config.Config{
+			Transport: config.TransportConfig{
+				Path: "/home/demo",
+			},
+		},
+		transport: transportImpl,
+	}
+
+	inspection, err := service.InspectRemote(context.Background())
+	if err != nil {
+		t.Fatalf("inspect remote: %v", err)
+	}
+
+	if inspection.SuggestedBasePath != "/home/storage/b/ef/25/demo" {
+		t.Fatalf("unexpected suggested base path: %s", inspection.SuggestedBasePath)
+	}
+	if inspection.SuggestedPublicRoot != "/home/storage/b/ef/25/demo/public_html" {
+		t.Fatalf("unexpected suggested public root: %s", inspection.SuggestedPublicRoot)
+	}
+	if !inspection.PublicHTMLExists {
+		t.Fatalf("expected public_html to be detected")
 	}
 }
 

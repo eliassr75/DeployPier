@@ -76,6 +76,33 @@ func (t *SFTPTransport) Probe(ctx context.Context) status.Report {
 	}
 }
 
+func (t *SFTPTransport) Inspect(ctx context.Context) (Inspection, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	client, err := t.connectLocked(ctx)
+	if err != nil {
+		return Inspection{}, err
+	}
+
+	currentDir, err := client.Getwd()
+	if err != nil {
+		return Inspection{}, status.Wrap(status.KindInternal, "inspect sftp current dir", err)
+	}
+
+	resolvedPath := cleanRemote(t.BasePath)
+	if strings.TrimSpace(t.BasePath) != "" {
+		if realPath, err := client.RealPath(t.BasePath); err == nil {
+			resolvedPath = cleanRemote(realPath)
+		}
+	}
+
+	return Inspection{
+		CurrentDir:   cleanRemote(currentDir),
+		ResolvedPath: resolvedPath,
+	}, nil
+}
+
 func (t *SFTPTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string) (UploadResult, error) {
 	if exists, err := t.Exists(ctx, remotePath); err != nil {
 		return UploadResult{}, err

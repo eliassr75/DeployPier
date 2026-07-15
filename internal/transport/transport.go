@@ -31,9 +31,15 @@ type FileInfo struct {
 	SHA256    string
 }
 
+type Inspection struct {
+	CurrentDir   string
+	ResolvedPath string
+}
+
 type Transport interface {
 	Name() string
 	Probe(ctx context.Context) status.Report
+	Inspect(ctx context.Context) (Inspection, error)
 	UploadRelease(ctx context.Context, release build.Release, remotePath string) (UploadResult, error)
 	ReadFile(ctx context.Context, remotePath string) ([]byte, error)
 	WriteFile(ctx context.Context, remotePath string, data []byte) error
@@ -102,6 +108,14 @@ func (t *LocalTransport) Probe(ctx context.Context) status.Report {
 		Code:    "ok",
 		Message: "local transport ready",
 	}
+}
+
+func (t *LocalTransport) Inspect(_ context.Context) (Inspection, error) {
+	resolved := filepath.Clean(t.BasePath)
+	return Inspection{
+		CurrentDir:   resolved,
+		ResolvedPath: resolved,
+	}, nil
 }
 
 func (t *LocalTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string) (UploadResult, error) {

@@ -85,6 +85,26 @@ func (t *FTPSTransport) Probe(ctx context.Context) status.Report {
 	}
 }
 
+func (t *FTPSTransport) Inspect(ctx context.Context) (Inspection, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	conn, err := t.connectLocked(ctx)
+	if err != nil {
+		return Inspection{}, err
+	}
+
+	currentDir, err := conn.CurrentDir()
+	if err != nil {
+		return Inspection{}, status.Wrap(status.KindInternal, "inspect ftps current dir", err)
+	}
+
+	return Inspection{
+		CurrentDir:   cleanRemote(currentDir),
+		ResolvedPath: cleanRemote(t.BasePath),
+	}, nil
+}
+
 func (t *FTPSTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string) (UploadResult, error) {
 	if exists, err := t.Exists(ctx, remotePath); err != nil {
 		return UploadResult{}, err
@@ -285,7 +305,7 @@ func (t *FTPSTransport) Exists(ctx context.Context, remotePath string) (bool, er
 	if err == nil {
 		return true, nil
 	}
-	if strings.Contains(strings.ToLower(err.Error()), "file unavailable") || strings.Contains(strings.ToLower(err.Error()), "not found") {
+	if isMissingFTP(err) {
 		return false, nil
 	}
 	return false, status.Wrap(status.KindInternal, "stat ftps path", err)
@@ -421,6 +441,17 @@ func defaultPort(port int, fallback int) int {
 		return port
 	}
 	return fallback
+}
+
+func isMissingFTP(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "file unavailable") ||
+		strings.Contains(message, "not found") ||
+		strings.Contains(message, "no such file or directory") ||
+		strings.Contains(message, "550")
 }
 
 func osReadFile(path string) ([]byte, error) {

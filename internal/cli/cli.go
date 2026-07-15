@@ -34,6 +34,8 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer,
 		return runDoctor(ctx, args[1:], stdout, env, cwd)
 	case "plan":
 		return runPlan(ctx, args[1:], stdout, env, cwd)
+	case "inspect-remote":
+		return runInspectRemote(ctx, args[1:], stdout, env, cwd)
 	case "build":
 		return runBuild(ctx, args[1:], stdout, env, cwd)
 	case "push":
@@ -84,6 +86,11 @@ func runDoctor(ctx context.Context, args []string, stdout io.Writer, env []strin
 		if _, err := fmt.Fprintln(stdout); err != nil {
 			return err
 		}
+		for _, note := range doctorExtraNotes(check) {
+			if _, err := fmt.Fprintf(stdout, "  -> %s\n", note); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -116,6 +123,59 @@ func runPlan(ctx context.Context, args []string, stdout io.Writer, env []string,
 	}
 	for _, step := range plan.Steps {
 		if _, err := fmt.Fprintf(stdout, "- %s\n", step); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runInspectRemote(ctx context.Context, args []string, stdout io.Writer, env []string, cwd string) error {
+	flags := flag.NewFlagSet("inspect-remote", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "", "path to deploy.yml")
+	envFile := flags.String("env-file", "", "path to .deploy.env file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	service, err := loadService(*configPath, *envFile, env, cwd)
+	if err != nil {
+		return err
+	}
+
+	inspection, err := service.InspectRemote(ctx)
+	if err != nil {
+		return err
+	}
+
+	lines := []struct {
+		key   string
+		value string
+	}{
+		{"transport", inspection.Transport},
+		{"current_dir", emptyDash(inspection.CurrentDir)},
+		{"configured_transport_path", emptyDash(inspection.ConfiguredTransportPath)},
+		{"resolved_transport_path", emptyDash(inspection.ResolvedTransportPath)},
+		{"configured_runtime_app_root", emptyDash(inspection.ConfiguredRuntimeAppRoot)},
+		{"configured_runtime_pointer", emptyDash(inspection.ConfiguredRuntimePointer)},
+		{"suggested_base_path", emptyDash(inspection.SuggestedBasePath)},
+		{"base_path_source", emptyDash(inspection.BasePathSource)},
+		{"suggested_transport_path", emptyDash(inspection.SuggestedTransportPath)},
+		{"suggested_remote_app_root", emptyDash(inspection.SuggestedAppRoot)},
+		{"suggested_remote_public_root", emptyDash(inspection.SuggestedPublicRoot)},
+		{"suggested_activation_pointer", emptyDash(inspection.SuggestedCurrentPointer)},
+		{"suggested_runtime_app_root", emptyDash(inspection.SuggestedRuntimeAppRoot)},
+		{"suggested_runtime_pointer", emptyDash(inspection.SuggestedRuntimePointer)},
+		{"check_public_html", boolLabel(inspection.PublicHTMLExists)},
+		{"check_app_dir", boolLabel(inspection.AppDirExists)},
+	}
+	for _, line := range lines {
+		if _, err := fmt.Fprintf(stdout, "%s: %s\n", line.key, line.value); err != nil {
+			return err
+		}
+	}
+	for _, note := range inspection.Notes {
+		if _, err := fmt.Fprintf(stdout, "note: %s\n", note); err != nil {
 			return err
 		}
 	}
@@ -451,12 +511,46 @@ func emptyDash(value string) string {
 	return value
 }
 
+func boolLabel(value bool) string {
+	if value {
+		return "ok"
+	}
+	return "missing"
+}
+
+func doctorExtraNotes(check app.DoctorCheck) []string {
+	if check.Name != "public_index" {
+		return nil
+	}
+
+	switch check.Report.Code {
+	case "created":
+		return []string{
+			"bootstrap remoto criado automaticamente para current-pointer mode",
+			"o arquivo usa runtime.app_root e runtime.current_pointer; revise esses paths se o PHP enxergar outro path absoluto na hospedagem",
+			"se ja existisse um index.php remoto, o DeployPier nao o sobrescreveria",
+		}
+	case "needs_adaptation":
+		return []string{
+			"o index.php remoto ja existe, mas ainda nao aponta para .deploypier/current.txt",
+			"use docs/deploypier-public-index.php.example como referencia para adaptar um front controller customizado",
+		}
+	case "missing":
+		return []string{
+			"o DeployPier so cria esse bootstrap automaticamente em layout release-based com activation.kind=pointer e runtime.* configurado",
+		}
+	default:
+		return nil
+	}
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "deploypier")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  doctor    Validate config, local state, and transport readiness")
 	fmt.Fprintln(w, "  plan      Print the local execution plan")
+	fmt.Fprintln(w, "  inspect-remote  Inspect the remote base path and suggest deploy paths")
 	fmt.Fprintln(w, "  build     Create a local release bundle and manifest")
 	fmt.Fprintln(w, "  push      Upload a release and optionally activate it")
 	fmt.Fprintln(w, "  rollback  Activate the previous or requested release")

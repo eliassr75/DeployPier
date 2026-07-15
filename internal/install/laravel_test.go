@@ -100,13 +100,19 @@ func TestInitLocawebCreatesDeployConfigFiles(t *testing.T) {
 	if !strings.Contains(deployYAML, `protocol: "ftps"`) {
 		t.Fatalf("expected deploy.yml to target ftps")
 	}
-	if !strings.Contains(deployYAML, `/home/myftpuser/public_html`) {
-		t.Fatalf("expected deploy.yml to contain public_html path")
+	if !strings.Contains(deployYAML, `public_root: "/public_html"`) {
+		t.Fatalf("expected deploy.yml to contain transport public_html path")
+	}
+	if !strings.Contains(deployYAML, `runtime:`) || !strings.Contains(deployYAML, `/home/myftpuser/.deploypier/current.txt`) {
+		t.Fatalf("expected deploy.yml to contain runtime paths")
 	}
 
 	deployEnv := mustRead(t, filepath.Join(projectRoot, ".deploy.env.example"))
 	if !strings.Contains(deployEnv, "DEPLOY_USER=myftpuser") {
 		t.Fatalf("expected ftp user inside deploy env example")
+	}
+	if !strings.Contains(deployEnv, "DEPLOY_REMOTE_APP_ROOT=/app") || !strings.Contains(deployEnv, "DEPLOY_RUNTIME_APP_ROOT=/home/myftpuser/app") {
+		t.Fatalf("expected deploy env example to separate transport and runtime paths")
 	}
 
 	indexExample := mustRead(t, filepath.Join(projectRoot, "docs", "deploypier-public-index.php.example"))
