@@ -115,7 +115,7 @@ func (s *Service) Plan(ctx context.Context) (Plan, error) {
 		Steps: []string{
 			"doctor validates config, hooks, and local transport health",
 			"build creates a release directory with bundle files and manifest.json",
-			"push uploads a built release, updates activation, and can call the Laravel post-deploy hook",
+			"push uploads a built release, synchronizes public assets, updates the current release pointer, and can call the Laravel post-deploy hook",
 			"rollback points activation back to the previous recorded release",
 		},
 	}, nil
@@ -156,6 +156,7 @@ func (s *Service) Doctor(ctx context.Context) ([]DoctorCheck, error) {
 		Report:  status.Classify(err),
 		Details: current,
 	})
+	checks = append(checks, s.publicIndexCheck(ctx))
 
 	hookCount := len(s.cfg.Hooks.BeforeBuild) +
 		len(s.cfg.Hooks.AfterBuild) +
@@ -435,24 +436,76 @@ func (s *Service) postDeployReport() status.Report {
 	return status.Report{Level: status.LevelOK, Code: "ok", Message: "post-deploy hook configured"}
 }
 
+func (s *Service) publicIndexCheck(ctx context.Context) DoctorCheck {
+	indexPath := joinServicePath(s.cfg.Remote.PublicRoot, "index.php")
+	exists, err := s.transport.Exists(ctx, indexPath)
+	if err != nil {
+		return DoctorCheck{
+			Name:    "public_index",
+			Report:  status.Classify(err),
+			Details: indexPath,
+		}
+	}
+	if !exists {
+		return DoctorCheck{
+			Name:    "public_index",
+			Report:  status.Report{Level: status.LevelWarn, Code: "missing", Message: "remote public index is missing; adapt it to DeployPier current pointer mode before the first activation"},
+			Details: indexPath,
+		}
+	}
+
+	raw, err := s.transport.ReadFile(ctx, indexPath)
+	if err != nil {
+		return DoctorCheck{
+			Name:    "public_index",
+			Report:  status.Classify(err),
+			Details: indexPath,
+		}
+	}
+	content := string(raw)
+	missing := make([]string, 0, 3)
+	for _, marker := range []string{
+		serviceBase(s.cfg.Activation.CurrentPointer),
+		"usePublicPath",
+		"/releases/",
+	} {
+		if !strings.Contains(content, marker) {
+			missing = append(missing, marker)
+		}
+	}
+	if len(missing) > 0 {
+		return DoctorCheck{
+			Name:    "public_index",
+			Report:  status.Report{Level: status.LevelWarn, Code: "needs_adaptation", Message: fmt.Sprintf("remote public index is not ready for current pointer mode; missing markers: %s", strings.Join(missing, ", "))},
+			Details: indexPath,
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "public_index",
+		Report:  status.Report{Level: status.LevelOK, Code: "ok", Message: "remote public index is compatible with current pointer mode"},
+		Details: indexPath,
+	}
+}
+
 func (s *Service) remoteReleasePath(releaseID string) string {
-	return path.Join(s.cfg.Remote.AppRoot, "releases", releaseID)
+	return joinServicePath(s.cfg.Remote.AppRoot, "releases", releaseID)
 }
 
 func (s *Service) remoteLockPath() string {
-	return path.Join(s.cfg.Remote.AppRoot, ".deploypier", "locks", "deploy.lock")
+	return joinServicePath(s.cfg.Remote.AppRoot, ".deploypier", "locks", "deploy.lock")
 }
 
 func (s *Service) acquireRemoteLock(ctx context.Context, releaseID string) (func(), error) {
 	lockPath := s.remoteLockPath()
-	if err := s.transport.MkdirAll(ctx, path.Dir(lockPath)); err != nil {
+	if err := s.transport.MkdirAll(ctx, serviceDir(lockPath)); err != nil {
 		return nil, err
 	}
 	if err := s.transport.Mkdir(ctx, lockPath); err != nil {
 		return nil, status.Wrap(status.KindConflict, "acquire remote deploy lock", err)
 	}
 	lockData := fmt.Sprintf("release_id=%s\ncreated_at=%s\n", releaseID, s.now().UTC().Format(time.RFC3339))
-	if err := s.transport.WriteFile(ctx, path.Join(lockPath, "owner.txt"), []byte(lockData)); err != nil {
+	if err := s.transport.WriteFile(ctx, joinServicePath(lockPath, "owner.txt"), []byte(lockData)); err != nil {
 		_ = s.transport.RemoveAll(ctx, lockPath)
 		return nil, err
 	}
@@ -462,7 +515,7 @@ func (s *Service) acquireRemoteLock(ctx context.Context, releaseID string) (func
 }
 
 func (s *Service) validateRemoteRelease(ctx context.Context, release build.Release, remotePath string) error {
-	raw, err := s.transport.ReadFile(ctx, path.Join(remotePath, "manifest.json"))
+	raw, err := s.transport.ReadFile(ctx, joinServicePath(remotePath, "manifest.json"))
 	if err != nil {
 		return status.Wrap(status.KindConflict, "read remote manifest", err)
 	}
@@ -482,7 +535,7 @@ func (s *Service) validateRemoteRelease(ctx context.Context, release build.Relea
 	}
 
 	for _, file := range release.Manifest.Files {
-		info, err := s.transport.HashFile(ctx, path.Join(remotePath, file.Path))
+		info, err := s.transport.HashFile(ctx, joinServicePath(remotePath, file.Path))
 		if err != nil {
 			return status.Wrap(status.KindConflict, "hash remote release file", err)
 		}
@@ -495,7 +548,7 @@ func (s *Service) validateRemoteRelease(ctx context.Context, release build.Relea
 }
 
 func (s *Service) pruneRemoteReleases(ctx context.Context) error {
-	releasesRoot := path.Join(s.cfg.Remote.AppRoot, "releases")
+	releasesRoot := joinServicePath(s.cfg.Remote.AppRoot, "releases")
 	entries, err := s.transport.ReadDir(ctx, releasesRoot)
 	if err != nil {
 		return nil
@@ -514,7 +567,7 @@ func (s *Service) pruneRemoteReleases(ctx context.Context) error {
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir {
-			names = append(names, path.Base(entry.Path))
+			names = append(names, serviceBase(entry.Path))
 		}
 	}
 	sort.Strings(names)
@@ -531,11 +584,34 @@ func (s *Service) pruneRemoteReleases(ctx context.Context) error {
 	}
 
 	for _, name := range candidates[:len(candidates)-s.cfg.Release.Retain] {
-		if err := s.transport.RemoveAll(ctx, path.Join(releasesRoot, name)); err != nil {
+		if err := s.transport.RemoveAll(ctx, joinServicePath(releasesRoot, name)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func joinServicePath(root string, parts ...string) string {
+	if strings.Contains(root, `\`) {
+		all := append([]string{root}, parts...)
+		return filepath.Clean(filepath.Join(all...))
+	}
+	all := append([]string{root}, parts...)
+	return path.Clean(path.Join(all...))
+}
+
+func serviceDir(value string) string {
+	if strings.Contains(value, `\`) {
+		return filepath.Dir(value)
+	}
+	return path.Dir(value)
+}
+
+func serviceBase(value string) string {
+	if strings.Contains(value, `\`) {
+		return filepath.Base(value)
+	}
+	return path.Base(value)
 }
 
 func currentGitMetadata(ctx context.Context, dir string) (string, string) {

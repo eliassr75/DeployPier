@@ -92,8 +92,8 @@ func TestInitLocawebCreatesDeployConfigFiles(t *testing.T) {
 		t.Fatalf("init locaweb config: %v", err)
 	}
 
-	if len(created) != 3 {
-		t.Fatalf("expected 3 created files, got %d", len(created))
+	if len(created) != 4 {
+		t.Fatalf("expected 4 created files, got %d", len(created))
 	}
 
 	deployYAML := mustRead(t, filepath.Join(projectRoot, "deploy.yml"))
@@ -107,6 +107,11 @@ func TestInitLocawebCreatesDeployConfigFiles(t *testing.T) {
 	deployEnv := mustRead(t, filepath.Join(projectRoot, ".deploy.env.example"))
 	if !strings.Contains(deployEnv, "DEPLOY_USER=myftpuser") {
 		t.Fatalf("expected ftp user inside deploy env example")
+	}
+
+	indexExample := mustRead(t, filepath.Join(projectRoot, "docs", "deploypier-public-index.php.example"))
+	if !strings.Contains(indexExample, ".deploypier/current.txt") {
+		t.Fatalf("expected public index example to use current pointer")
 	}
 }
 

@@ -120,56 +120,30 @@ func (a *PointerActivator) Activate(ctx context.Context, releaseID string, reaso
 
 func (a *PointerActivator) activateReleaseBased(ctx context.Context, releaseID string, reason string) (Result, error) {
 	releasePath := a.releasePath(releaseID)
-	stagePath := a.publicStagePath(releaseID)
-	previousPath := a.publicBackupPath()
-
-	if err := a.preparePublicStage(ctx, releaseID, stagePath); err != nil {
+	if err := a.validatePublicIndex(ctx); err != nil {
 		return Result{}, err
 	}
-	if err := a.writeIndexWrapper(ctx, releaseID, stagePath); err != nil {
+	if err := a.syncActivePublic(ctx, releaseID); err != nil {
 		return Result{}, err
 	}
-	if err := a.preserveStoragePath(ctx, stagePath); err != nil {
-		return Result{}, err
-	}
-
-	_ = a.FS.RemoveAll(ctx, previousPath)
-	publicExists, err := a.FS.Exists(ctx, a.Remote.PublicRoot)
-	if err != nil {
-		return Result{}, err
-	}
-	if publicExists {
-		if err := a.FS.Rename(ctx, a.Remote.PublicRoot, previousPath); err != nil {
-			return Result{}, status.Wrap(status.KindInternal, "swap public root to backup", err)
-		}
-	}
-
-	if err := a.FS.Rename(ctx, stagePath, a.Remote.PublicRoot); err != nil {
-		if publicExists {
-			_ = a.FS.Rename(ctx, previousPath, a.Remote.PublicRoot)
-		}
-		return Result{}, status.Wrap(status.KindInternal, "promote staged public root", err)
-	}
-
 	if err := a.persistActivation(ctx, releaseID, reason, "release-based"); err != nil {
 		return Result{}, err
 	}
-	_ = a.FS.RemoveAll(ctx, previousPath)
 
 	return Result{
 		ReleaseID:   releaseID,
 		ReleasePath: releasePath,
 		PublicPath:  a.Remote.PublicRoot,
 		Mode:        "release-based",
-		Message:     "public_html swapped and activation state updated",
+		Message:     "current pointer updated and public assets synchronized",
 	}, nil
 }
 
 func (a *PointerActivator) activateInPlace(ctx context.Context, releaseID string, reason string) (Result, error) {
-	if err := a.preparePublicStage(ctx, releaseID, a.Remote.PublicRoot); err != nil {
+	if err := a.validatePublicIndex(ctx); err != nil {
 		return Result{}, err
 	}
-	if err := a.writeIndexWrapper(ctx, releaseID, a.Remote.PublicRoot); err != nil {
+	if err := a.syncActivePublic(ctx, releaseID); err != nil {
 		return Result{}, err
 	}
 	if err := a.persistActivation(ctx, releaseID, reason, "in-place"); err != nil {
@@ -180,22 +154,19 @@ func (a *PointerActivator) activateInPlace(ctx context.Context, releaseID string
 		ReleasePath: a.releasePath(releaseID),
 		PublicPath:  a.Remote.PublicRoot,
 		Mode:        "in-place",
-		Message:     "public_html updated in place and activation state updated",
+		Message:     "current pointer updated and public assets synchronized in place",
 	}, nil
 }
 
-func (a *PointerActivator) preparePublicStage(ctx context.Context, releaseID string, targetRoot string) error {
+func (a *PointerActivator) syncActivePublic(ctx context.Context, releaseID string) error {
 	releasePublicRoot := joinActivationPath(a.releasePath(releaseID), "public")
 	if err := a.ensureReleaseReady(ctx, releaseID); err != nil {
 		return err
 	}
-	if targetRoot != a.Remote.PublicRoot {
-		_ = a.FS.RemoveAll(ctx, targetRoot)
-		if err := a.FS.MkdirAll(ctx, targetRoot); err != nil {
-			return err
-		}
+	if err := a.FS.MkdirAll(ctx, a.Remote.PublicRoot); err != nil {
+		return err
 	}
-	return a.syncPublicTree(ctx, releasePublicRoot, targetRoot, targetRoot == a.Remote.PublicRoot)
+	return a.syncPublicTree(ctx, releasePublicRoot, a.Remote.PublicRoot, true)
 }
 
 func (a *PointerActivator) syncPublicTree(ctx context.Context, sourceRoot string, targetRoot string, inPlace bool) error {
@@ -283,20 +254,6 @@ func (a *PointerActivator) collectReleasePublicPaths(ctx context.Context, root s
 	return nil
 }
 
-func (a *PointerActivator) preserveStoragePath(ctx context.Context, stagePath string) error {
-	liveStorage := joinActivationPath(a.Remote.PublicRoot, "storage")
-	exists, err := a.FS.Exists(ctx, liveStorage)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return nil
-	}
-	stageStorage := joinActivationPath(stagePath, "storage")
-	_ = a.FS.RemoveAll(ctx, stageStorage)
-	return a.FS.Rename(ctx, liveStorage, stageStorage)
-}
-
 func (a *PointerActivator) ensureReleaseReady(ctx context.Context, releaseID string) error {
 	requiredPaths := []string{
 		a.releasePath(releaseID),
@@ -311,6 +268,35 @@ func (a *PointerActivator) ensureReleaseReady(ctx context.Context, releaseID str
 		}
 		if !exists {
 			return status.Wrap(status.KindNotFound, "validate remote release", fmt.Errorf("missing remote release path: %s", required))
+		}
+	}
+	return nil
+}
+
+func (a *PointerActivator) validatePublicIndex(ctx context.Context) error {
+	indexPath := joinActivationPath(a.Remote.PublicRoot, "index.php")
+	exists, err := a.FS.Exists(ctx, indexPath)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return status.Wrap(status.KindConflict, "validate remote public index", fmt.Errorf("missing %s; generate a stable index.php that reads %s before activating", indexPath, a.CurrentPointer))
+	}
+
+	raw, err := a.FS.ReadFile(ctx, indexPath)
+	if err != nil {
+		return status.Wrap(status.KindConflict, "read remote public index", err)
+	}
+
+	content := string(raw)
+	markers := []string{
+		baseActivationPath(a.CurrentPointer),
+		"usePublicPath",
+		"/releases/",
+	}
+	for _, marker := range markers {
+		if !strings.Contains(content, marker) {
+			return status.Wrap(status.KindConflict, "validate remote public index", fmt.Errorf("%s is not compatible with DeployPier current pointer mode; missing marker %q", indexPath, marker))
 		}
 	}
 	return nil
@@ -384,43 +370,8 @@ func (a *PointerActivator) atomicWrite(ctx context.Context, targetPath string, d
 	return nil
 }
 
-func (a *PointerActivator) writeIndexWrapper(ctx context.Context, releaseID string, targetRoot string) error {
-	content := fmt.Sprintf(`<?php
-declare(strict_types=1);
-
-$releaseRoot = %q;
-$maintenance = $releaseRoot.'/storage/framework/maintenance.php';
-$autoload = $releaseRoot.'/vendor/autoload.php';
-$bootstrap = $releaseRoot.'/bootstrap/app.php';
-
-if (is_file($maintenance)) {
-    require $maintenance;
-}
-
-if (! is_file($autoload) || ! is_file($bootstrap)) {
-    http_response_code(503);
-    echo 'DeployPier: active release is incomplete.';
-    exit(1);
-}
-
-require $autoload;
-$app = require_once $bootstrap;
-$app->usePublicPath(__DIR__);
-return $app;
-`, a.releasePath(releaseID))
-	return a.FS.WriteFile(ctx, joinActivationPath(targetRoot, "index.php"), []byte(content))
-}
-
 func (a *PointerActivator) releasePath(releaseID string) string {
 	return joinActivationPath(a.Remote.AppRoot, "releases", releaseID)
-}
-
-func (a *PointerActivator) publicStagePath(releaseID string) string {
-	return joinActivationPath(dirActivationPath(a.Remote.PublicRoot), baseActivationPath(a.Remote.PublicRoot)+".deploypier-"+releaseID+".next")
-}
-
-func (a *PointerActivator) publicBackupPath() string {
-	return joinActivationPath(dirActivationPath(a.Remote.PublicRoot), baseActivationPath(a.Remote.PublicRoot)+".deploypier-prev")
 }
 
 func (a *PointerActivator) statePath() string {

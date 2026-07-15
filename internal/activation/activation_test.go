@@ -32,6 +32,12 @@ func TestPointerActivatorReleaseBasedSwapAndState(t *testing.T) {
 	makeRelease("rel-2", "second-build")
 
 	mustMkdirAll(t, publicRoot)
+	mustWriteFile(t, filepath.Join(publicRoot, "index.php"), []byte(`<?php
+$pointerFile = '/tmp/.deploypier/current.txt';
+$releaseId = trim((string) file_get_contents($pointerFile));
+$releaseRoot = '/tmp/app/releases/'.$releaseId;
+$app->usePublicPath(__DIR__);
+`))
 	mustWriteFile(t, filepath.Join(publicRoot, "storage"), []byte("preserve-me"))
 
 	fs := &transport.LocalTransport{BasePath: remoteRoot}

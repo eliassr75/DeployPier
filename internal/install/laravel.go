@@ -134,9 +134,10 @@ func (i *LocawebConfigInitializer) Install(projectRoot string, ftpUser string, f
 
 	projectName := filepath.Base(projectRoot)
 	files := map[string]string{
-		filepath.Join(projectRoot, "deploy.yml"):                renderLocawebDeployYAML(projectName, ftpUser),
-		filepath.Join(projectRoot, ".deploy.env.example"):       renderLocawebDeployEnvExample(ftpUser),
-		filepath.Join(projectRoot, "docs", "deploy-locaweb.md"): renderLocawebDeployGuide(projectName, ftpUser),
+		filepath.Join(projectRoot, "deploy.yml"):                                  renderLocawebDeployYAML(projectName, ftpUser),
+		filepath.Join(projectRoot, ".deploy.env.example"):                         renderLocawebDeployEnvExample(ftpUser),
+		filepath.Join(projectRoot, "docs", "deploy-locaweb.md"):                   renderLocawebDeployGuide(projectName, ftpUser),
+		filepath.Join(projectRoot, "docs", "deploypier-public-index.php.example"): renderLocawebPublicIndexExample(ftpUser),
 	}
 
 	created := make([]string, 0, len(files))
@@ -1083,7 +1084,7 @@ cat <<'EOF'
 Checklist manual Locaweb:
 1. Reabra a sessao shell ou rode: source "$BASH_PROFILE_PATH"
 2. Confirme que o link public_html/storage existe e aponta para storage/app/public.
-3. No modo release-based, o DeployPier passa a gerenciar public_html/index.php nas ativacoes.
+3. Adapte o public_html/index.php para ler .deploypier/current.txt antes do primeiro deploy.
 
 EOF
 `, ftpUser, ftpUser)
@@ -1131,8 +1132,8 @@ func renderLocawebBootstrapDoc(ftpUser string) string {
 			"## Uso sugerido\n\n"+
 			"%[1]s%[1]s%[1]sbash\ncd /caminho/do/projeto\nbash scripts/locaweb/bootstrap-first-deploy.sh\n%[1]s%[1]s%[1]s\n\n"+
 			"## Observacao sobre o front controller\n\n"+
-			"No modo %[1]srelease-based%[1]s, o DeployPier passa a regenerar o %[1]spublic_html/index.php%[1]s durante a ativacao para apontar para a release publicada.\n\n"+
-			"Se voce estiver usando um fluxo legado fora do DeployPier, ai sim ainda faz sentido manter o front controller manual apontando para o bootstrap do Laravel.\n\n"+
+			"No modo %[1]srelease-based%[1]s, o %[1]spublic_html/index.php%[1]s deve permanecer estavel e ler a release ativa a partir de %[1]s.deploypier/current.txt%[1]s.\n\n"+
+			"O DeployPier nao sobrescreve automaticamente um front controller ja customizado pelo projeto. A recomendacao e adaptar esse arquivo uma vez e manter a logica do ponteiro.\n\n"+
 			"O hook HTTP do Laravel nao e o lugar certo para esse bootstrap inicial porque:\n\n"+
 			"- alias de shell continuam sendo contexto do usuario, nao de um request HTTP;\n"+
 			"- %[1]scomposer install%[1]s ainda pode ser util em manutencao manual, antes da app estar operacional;\n"+
@@ -1219,6 +1220,44 @@ DEPLOY_HOOK_SECRET=
 `, ftpUser, ftpUser, ftpUser)
 }
 
+func renderLocawebPublicIndexExample(ftpUser string) string {
+	return fmt.Sprintf(`<?php
+declare(strict_types=1);
+
+$basePath = '/home/%s/app';
+$pointerFile = '/home/%s/.deploypier/current.txt';
+
+$releaseId = trim((string) @file_get_contents($pointerFile));
+
+if ($releaseId === '') {
+    http_response_code(503);
+    echo 'DeployPier: current release pointer is empty.';
+    exit(1);
+}
+
+$releaseRoot = $basePath.'/releases/'.$releaseId;
+$maintenance = $releaseRoot.'/storage/framework/maintenance.php';
+$autoload = $releaseRoot.'/vendor/autoload.php';
+$bootstrap = $releaseRoot.'/bootstrap/app.php';
+
+if (is_file($maintenance)) {
+    require $maintenance;
+}
+
+if (! is_file($autoload) || ! is_file($bootstrap)) {
+    http_response_code(503);
+    echo 'DeployPier: active release is incomplete.';
+    exit(1);
+}
+
+require $autoload;
+$app = require_once $bootstrap;
+$app->usePublicPath(__DIR__);
+
+return $app;
+`, ftpUser, ftpUser)
+}
+
 func renderLocawebDeployGuide(projectName string, ftpUser string) string {
 	return fmt.Sprintf(
 		"# Deploy Locaweb\n\n"+
@@ -1226,6 +1265,7 @@ func renderLocawebDeployGuide(projectName string, ftpUser string) string {
 			"## Arquivos\n\n"+
 			"- deploy.yml\n"+
 			"- .deploy.env.example\n"+
+			"- docs/deploypier-public-index.php.example\n"+
 			"- scripts/locaweb/bootstrap-first-deploy.sh\n"+
 			"- scripts/locaweb/fix-storage-link.sh\n\n"+
 			"## Ordem sugerida\n\n"+
@@ -1233,17 +1273,19 @@ func renderLocawebDeployGuide(projectName string, ftpUser string) string {
 			"    deploypier install-laravel-hook -project-root .\n\n"+
 			"2. Gere o bootstrap Locaweb:\n\n"+
 			"    deploypier install-locaweb-bootstrap -project-root . -ftp-user %s\n\n"+
-			"3. Execute o bootstrap inicial no shell da hospedagem.\n\n"+
-			"4. Copie .deploy.env.example para .deploy.env e preencha as variaveis locais.\n\n"+
-			"5. Rode:\n\n"+
+			"3. Adapte manualmente o public_html/index.php do projeto usando docs/deploypier-public-index.php.example como base.\n\n"+
+			"4. Execute o bootstrap inicial no shell da hospedagem.\n\n"+
+			"5. Copie .deploy.env.example para .deploy.env e preencha as variaveis locais.\n\n"+
+			"6. Rode:\n\n"+
 			"    deploypier doctor -config ./deploy.yml\n"+
 			"    deploypier plan -config ./deploy.yml\n\n"+
-			"6. Rode o primeiro deploy:\n\n"+
+			"7. Rode o primeiro deploy:\n\n"+
 			"    deploypier push -config ./deploy.yml\n\n"+
 			"## Observacoes\n\n"+
 			"- O deploy assume que os arquivos publicos do Laravel ficam em public_html.\n"+
 			"- O hook HTTP serve para pos-deploy da app ja operacional; bootstrap inicial continua no shell.\n"+
-			"- No modo release-based, o DeployPier gerencia public_html/index.php durante as ativacoes.\n",
+			"- O public_html/index.php deve ser estavel e ler a release ativa a partir de .deploypier/current.txt.\n"+
+			"- O DeployPier nao sobrescreve automaticamente um index.php ja customizado pelo projeto.\n",
 		projectName, ftpUser, ftpUser,
 	)
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -385,4 +386,48 @@ return new class {
 	if len(result.Warnings) == 0 {
 		t.Fatalf("expected manual migration warning")
 	}
+}
+
+func TestDoctorWarnsWhenPublicIndexIsNotReadyForCurrentPointerMode(t *testing.T) {
+	transportImpl := &fakeTransport{
+		files: map[string][]byte{
+			"/remote/public_html/index.php": []byte("<?php $app->usePublicPath(__DIR__);"),
+		},
+	}
+	service := &Service{
+		cfg: config.Config{
+			Remote: config.RemoteConfig{
+				PublicRoot: "/remote/public_html",
+			},
+			Activation: config.ActivationConfig{
+				CurrentPointer: "/remote/.deploypier/current.txt",
+			},
+		},
+		transport: transportImpl,
+		activator: &fakeActivator{},
+	}
+
+	checks, err := service.Doctor(context.Background())
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+
+	check := findDoctorCheck(t, checks, "public_index")
+	if check.Report.Level != status.LevelWarn {
+		t.Fatalf("expected warning for public index, got %s", check.Report.Level)
+	}
+	if !strings.Contains(check.Report.Message, "current pointer mode") {
+		t.Fatalf("unexpected message: %s", check.Report.Message)
+	}
+}
+
+func findDoctorCheck(t *testing.T, checks []DoctorCheck, name string) DoctorCheck {
+	t.Helper()
+	for _, check := range checks {
+		if check.Name == name {
+			return check
+		}
+	}
+	t.Fatalf("doctor check not found: %s", name)
+	return DoctorCheck{}
 }

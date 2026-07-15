@@ -75,12 +75,17 @@ Isso gera:
 
 - `deploy.yml`
 - `.deploy.env.example`
+- `docs/deploypier-public-index.php.example`
 - integração Laravel para o hook de pós-deploy
 - scripts de bootstrap/manual para Locaweb
 
 ### 2. Preparar o ambiente local
 
 Copie `.deploy.env.example` para `.deploy.env` e preencha as credenciais e paths do host.
+
+Antes do primeiro deploy, adapte o `public_html/index.php` do projeto usando `docs/deploypier-public-index.php.example` como base.
+
+O objetivo desse arquivo é manter um front controller estável, que lê a release ativa a partir de `.deploypier/current.txt`.
 
 ### 3. Validar a configuração
 
@@ -125,11 +130,9 @@ No modo padrão `release-based`, o fluxo é:
 3. geração de `manifest.json`
 4. upload da release para `app/releases/<release_id>`
 5. verificação remota do manifesto
-6. montagem de um novo `public_html` temporário
-7. geração de um `index.php` que aponta para a release ativa
-8. swap remoto por rename
-9. atualização do estado remoto e do ponteiro de release atual
-10. hook Laravel assinado, quando `post_deploy.mode=auto`
+6. sincronização dos assets públicos para `public_html`, preservando `index.php` e `storage`
+7. atualização do estado remoto e do ponteiro de release atual em `.deploypier/current.txt`
+8. hook Laravel assinado, quando `post_deploy.mode=auto`
 
 No rollback, a CLI reativa a release anterior registrada no estado remoto e recompõe o `public_html` com os assets daquela release.
 
@@ -252,7 +255,7 @@ deploypier install-locaweb-bootstrap -project-root /path/to/app -ftp-user meuusu
 
 ### `init-locaweb`
 
-Gera `deploy.yml`, `.deploy.env.example` e a documentação inicial para um projeto Laravel hospedado nesse cenário.
+Gera `deploy.yml`, `.deploy.env.example`, o exemplo de `index.php` compatível com `current.txt` e a documentação inicial para um projeto Laravel hospedado nesse cenário.
 
 ```bash
 deploypier init-locaweb -project-root /path/to/app -ftp-user meuusuarioftp
@@ -395,7 +398,7 @@ O bootstrap gerado cobre tarefas que normalmente acabam sendo feitas manualmente
 - usar `composer.phar` manualmente quando necessário
 - recriar o symlink `public_html/storage`
 
-No modo `release-based`, o `DeployPier` passa a gerenciar `public_html/index.php` durante a ativação. Na prática, o front controller deixa de ser um passo manual do deploy normal.
+No modo `release-based`, o `public_html/index.php` deve ficar estável e ler a release ativa usando `.deploypier/current.txt`. O `DeployPier` não sobrescreve automaticamente um `index.php` já customizado pelo projeto.
 
 ## Segurança
 
