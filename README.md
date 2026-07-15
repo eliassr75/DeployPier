@@ -1,12 +1,14 @@
 # DeployPier
 
-CLI standalone em Go para deploy de projetos Laravel em shared hosting, com foco em um problema bem específico: tirar o deploy do modo "arrasta arquivo no FTP" e levar isso para um fluxo repetível, auditável e mais seguro.
+CLI standalone em Go para deploy de projetos Laravel em shared hosting.
 
-O foco do projeto é o cenário clássico de hospedagem compartilhada, incluindo provedores como a Locaweb, onde normalmente existe FTPS/SFTP, `public_html` fixo e pouca ou nenhuma automação nativa.
+A proposta do `DeployPier` é simples: substituir o deploy manual via FTP por um fluxo repetível, auditável e mais seguro, sem exigir VPS, Docker no host ou shell avançado no servidor.
+
+O foco do projeto é o cenário clássico de hospedagem compartilhada, incluindo provedores como a Locaweb, onde normalmente existem FTPS/SFTP, `public_html` fixo e pouca ou nenhuma automação nativa.
 
 ## Posicionamento
 
-O `DeployPier` não tenta transformar shared hosting em VPS. A proposta é trabalhar com as limitações reais desse ambiente e ainda assim entregar:
+O `DeployPier` não tenta transformar shared hosting em VPS. A ideia é trabalhar com as limitações reais desse ambiente e ainda assim entregar:
 
 - build local
 - release versionada
@@ -18,7 +20,7 @@ O `DeployPier` não tenta transformar shared hosting em VPS. A proposta é traba
 
 ## Status atual
 
-O MVP já está funcional para o fluxo principal de deploy.
+O MVP já está funcional para o fluxo principal de deploy e já cobre a espinha dorsal da publicação de uma aplicação Laravel nesse tipo de hospedagem.
 
 Já implementado:
 
@@ -50,6 +52,18 @@ No modo padrão `release-based`, o fluxo é:
 10. hook Laravel assinado, quando `post_deploy.mode=auto`
 
 No rollback, a CLI reativa a release anterior registrada no estado remoto e recompõe o `public_html` com os assets daquela release.
+
+## Fluxo rápido
+
+Para um projeto Laravel novo nesse cenário, o caminho mais comum é:
+
+1. gerar a configuração inicial com `init-locaweb`
+2. gerar o receiver Laravel com `install-laravel-hook`
+3. gerar o bootstrap Locaweb com `install-locaweb-bootstrap`
+4. preparar as variáveis em `.deploy.env`
+5. rodar `doctor`
+6. rodar `build`
+7. rodar `push`
 
 ## Por que Go
 
@@ -92,7 +106,7 @@ deploypier doctor -config ./deploy.yml
 
 ### `plan`
 
-Mostra o plano atual sem alterar nada.
+Mostra o plano atual sem alterar nada, incluindo estratégia de layout e modo de pós-deploy.
 
 ```bash
 deploypier plan -config ./deploy.yml
@@ -124,7 +138,7 @@ deploypier push -config ./deploy.yml -skip-activate
 
 ### `rollback`
 
-Reativa a release anterior registrada remotamente ou uma release informada manualmente.
+Reativa a release anterior registrada no estado remoto ou uma release informada manualmente.
 
 ```bash
 deploypier rollback -config ./deploy.yml
@@ -136,7 +150,7 @@ deploypier rollback -config ./deploy.yml -release 20260715T101500Z
 
 ### `install-laravel-hook`
 
-Gera o receiver Laravel assinado para o pós-deploy.
+Gera a estrutura Laravel para receber o hook assinado de pós-deploy.
 
 ```bash
 deploypier install-laravel-hook -project-root /path/to/app
@@ -144,7 +158,7 @@ deploypier install-laravel-hook -project-root /path/to/app
 
 ### `install-locaweb-bootstrap`
 
-Gera scripts e documentação para bootstrap e manutenção manual na Locaweb.
+Gera scripts e documentação para bootstrap inicial e manutenção manual na Locaweb.
 
 ```bash
 deploypier install-locaweb-bootstrap -project-root /path/to/app -ftp-user meuusuarioftp
@@ -152,7 +166,7 @@ deploypier install-locaweb-bootstrap -project-root /path/to/app -ftp-user meuusu
 
 ### `init-locaweb`
 
-Gera `deploy.yml`, `.deploy.env.example` e a documentação inicial para um projeto Laravel nesse cenário.
+Gera `deploy.yml`, `.deploy.env.example` e a documentação inicial para um projeto Laravel hospedado nesse cenário.
 
 ```bash
 deploypier init-locaweb -project-root /path/to/app -ftp-user meuusuarioftp
@@ -224,7 +238,7 @@ O arquivo completo de exemplo está em [deploy.yml.example](./deploy.yml.example
 
 ## Variáveis de ambiente
 
-Segredos ficam fora do `deploy.yml`.
+Os segredos ficam fora do `deploy.yml`.
 
 ```bash
 DEPLOY_HOST=
@@ -245,11 +259,11 @@ Para SFTP, você também pode apontar o arquivo de `known_hosts` via:
 DEPLOYPIER_TRANSPORT_KNOWN_HOSTS=
 ```
 
-Você pode usar `.deploy.env` localmente. A CLI carrega esse arquivo automaticamente quando ele está ao lado do `deploy.yml`.
+Você pode usar `.deploy.env` localmente. A CLI carrega esse arquivo automaticamente quando ele estiver ao lado do `deploy.yml`.
 
 ## Hook Laravel
 
-O receiver gerado expõe:
+O receiver gerado expõe o endpoint:
 
 ```text
 POST /api/internal/deploy/receive
@@ -265,7 +279,7 @@ Headers esperados:
 - `X-Deploy-Signature-Scope`
 - `X-Deploy-Signature`
 
-Pipeline do pós-deploy:
+O pipeline de pós-deploy executado pelo receiver é:
 
 - `migrate --force`
 - `optimize:clear`
@@ -281,7 +295,7 @@ post_deploy:
   mode: "manual"
 ```
 
-Quando `mode=auto`, a CLI só aceita migrations muito aditivas e curtas. Se o diff não puder ser avaliado, ou se aparecer qualquer migration fora da allowlist, o caminho automático é bloqueado antes da promoção.
+Quando `mode=auto`, a CLI só aceita migrations bem aditivas e curtas. Se o diff não puder ser avaliado, ou se aparecer qualquer migration fora da allowlist, o caminho automático é bloqueado antes da promoção.
 
 Em `mode=manual`, o deploy de código pode seguir, mas o resultado volta como `needs_manual_migration` quando houver migration detectada.
 
@@ -289,13 +303,13 @@ Em `mode=manual`, o deploy de código pode seguir, mas o resultado volta como `n
 
 O projeto inclui um fluxo específico para Locaweb porque esse cenário motivou a ferramenta.
 
-O bootstrap gerado ainda pode ser útil para:
+O bootstrap gerado cobre tarefas que normalmente acabam sendo feitas manualmente na primeira publicação:
 
 - instalar aliases no shell
 - usar `composer.phar` manualmente quando necessário
 - recriar o symlink `public_html/storage`
 
-No modo `release-based`, o `DeployPier` passa a gerenciar `public_html/index.php` durante a ativação. Ou seja: o front controller deixa de ser um passo manual do deploy normal.
+No modo `release-based`, o `DeployPier` passa a gerenciar `public_html/index.php` durante a ativação. Na prática, o front controller deixa de ser um passo manual do deploy normal.
 
 ## Segurança
 
