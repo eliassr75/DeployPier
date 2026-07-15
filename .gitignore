@@ -1,0 +1,7 @@
+.deploy.env
+.deploypier/
+bin/
+dist/
+coverage.out
+*.exe
+*.test

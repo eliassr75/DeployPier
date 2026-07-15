@@ -1,0 +1,56 @@
+project:
+  name: "example-laravel-app"
+  framework: "laravel"
+  root: "."
+
+build:
+  php_command: "composer install --no-dev --prefer-dist --optimize-autoloader"
+  node_command: "npm ci && npm run build"
+  include:
+    - "app/**"
+    - "bootstrap/**"
+    - "config/**"
+    - "database/**"
+    - "public/**"
+    - "resources/**"
+    - "routes/**"
+    - "vendor/**"
+  exclude:
+    - ".env*"
+    - ".git/**"
+    - "docs/**"
+    - "node_modules/**"
+    - "storage/**"
+    - "tests/**"
+
+release:
+  directory: "./.deploypier/releases"
+  retain: 5
+
+transport:
+  kind: "ftps"
+  protocol: "ftps"
+  host: ""
+  port: 21
+  user: ""
+  path: "/home/ftp-user"
+  known_hosts: ""
+  allow_insecure: false
+
+remote:
+  app_root: "/home/ftp-user/app"
+  public_root: "/home/ftp-user/public_html"
+  layout: "release-based"
+
+post_deploy:
+  mode: "manual"
+  hook_url_env: "DEPLOY_HOOK_URL"
+  key_id_env: "DEPLOY_HOOK_KEY_ID"
+  secret_env: "DEPLOY_HOOK_SECRET"
+
+state:
+  file: "./.deploypier/state.json"
+
+activation:
+  kind: "pointer"
+  current_pointer: "/home/ftp-user/.deploypier/current.txt"
