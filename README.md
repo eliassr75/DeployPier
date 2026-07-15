@@ -173,15 +173,49 @@ Para usar a CLI em um projeto Laravel:
 
 ## Instalação
 
-```bash
-go build -o deploypier .
-```
+O projeto não instala o comando `deploypier` no `PATH` do sistema automaticamente.
 
-Para rodar em desenvolvimento:
+Hoje você pode usar a CLI de três formas.
+
+### 1. Rodar com Go sem instalar binário
 
 ```bash
 go run . help
 ```
+
+Para executar um comando real:
+
+```bash
+go run . init-locaweb -project-root . -ftp-user meuusuarioftp
+```
+
+### 2. Compilar o binário e usar no diretório atual
+
+```bash
+go build -o deploypier .
+```
+
+Depois disso:
+
+```bash
+./deploypier init-locaweb -project-root . -ftp-user meuusuarioftp
+```
+
+No Windows:
+
+```powershell
+go build -o deploypier.exe .
+.\deploypier.exe init-locaweb -project-root C:\caminho\app -ftp-user meuusuarioftp
+```
+
+### 3. Colocar o binário em um diretório do `PATH`
+
+Se você quiser usar `deploypier ...` de qualquer pasta, aí sim precisa copiar o binário para um diretório que já esteja no `PATH` do seu sistema, ou adicionar esse diretório manualmente.
+
+Os exemplos abaixo assumem que:
+
+- você está executando o binário local no diretório atual
+- ou já adicionou o binário ao `PATH`
 
 ## Comandos
 
