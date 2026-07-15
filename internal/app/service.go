@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -615,16 +614,11 @@ func serviceBase(value string) string {
 }
 
 func currentGitMetadata(ctx context.Context, dir string) (string, string) {
-	return gitCommand(ctx, dir, "git rev-parse --abbrev-ref HEAD"), gitCommand(ctx, dir, "git rev-parse HEAD")
+	return gitCommand(ctx, dir, "rev-parse", "--abbrev-ref", "HEAD"), gitCommand(ctx, dir, "rev-parse", "HEAD")
 }
 
-func gitCommand(ctx context.Context, dir string, command string) string {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/c", command)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-lc", command)
-	}
+func gitCommand(ctx context.Context, dir string, args ...string) string {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	output, err := cmd.Output()
 	if err != nil {

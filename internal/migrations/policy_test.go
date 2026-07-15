@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -72,10 +73,7 @@ return new class {
 
 func TestChangedMigrationFilesParsesGitDiffOutput(t *testing.T) {
 	projectRoot := t.TempDir()
-	gitScript := filepath.Join(projectRoot, "git.cmd")
-	if err := os.WriteFile(gitScript, []byte("@echo off\r\necho database/migrations/2026_07_15_000000_create_widgets_table.php\r\n"), 0o644); err != nil {
-		t.Fatalf("write git stub: %v", err)
-	}
+	writeGitStub(t, projectRoot, "database/migrations/2026_07_15_000000_create_widgets_table.php\n")
 
 	originalPath := os.Getenv("PATH")
 	t.Setenv("PATH", projectRoot+string(os.PathListSeparator)+originalPath)
@@ -87,5 +85,24 @@ func TestChangedMigrationFilesParsesGitDiffOutput(t *testing.T) {
 
 	if len(files) != 1 || files[0] != "database/migrations/2026_07_15_000000_create_widgets_table.php" {
 		t.Fatalf("unexpected migration files: %#v", files)
+	}
+}
+
+func writeGitStub(t *testing.T, dir string, stdout string) {
+	t.Helper()
+
+	if runtime.GOOS == "windows" {
+		gitScript := filepath.Join(dir, "git.cmd")
+		content := "@echo off\r\n" + "echo " + stdout
+		if err := os.WriteFile(gitScript, []byte(content), 0o644); err != nil {
+			t.Fatalf("write git stub: %v", err)
+		}
+		return
+	}
+
+	gitScript := filepath.Join(dir, "git")
+	content := "#!/bin/sh\nprintf '%s' \"" + stdout + "\"\n"
+	if err := os.WriteFile(gitScript, []byte(content), 0o755); err != nil {
+		t.Fatalf("write git stub: %v", err)
 	}
 }

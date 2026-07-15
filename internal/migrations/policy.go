@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/deploypier/deploypier/internal/status"
@@ -91,12 +90,7 @@ func autoSafe(content string) bool {
 }
 
 func changedMigrationFiles(ctx context.Context, projectRoot string) ([]string, error) {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/c", "git diff --name-only HEAD~1 HEAD -- database/migrations")
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-lc", "git diff --name-only HEAD~1 HEAD -- database/migrations")
-	}
+	cmd := exec.CommandContext(ctx, "git", "diff", "--name-only", "HEAD~1", "HEAD", "--", "database/migrations")
 	cmd.Dir = projectRoot
 	output, err := cmd.Output()
 	if err != nil {

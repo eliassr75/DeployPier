@@ -349,10 +349,7 @@ return new class {
 		t.Fatalf("write migration: %v", err)
 	}
 
-	gitScript := filepath.Join(projectRoot, "git.cmd")
-	if err := os.WriteFile(gitScript, []byte("@echo off\r\necho database/migrations/2026_07_15_000000_create_widgets_table.php\r\n"), 0o644); err != nil {
-		t.Fatalf("write git stub: %v", err)
-	}
+	writeGitStub(t, projectRoot, "database/migrations/2026_07_15_000000_create_widgets_table.php\n")
 	originalPath := os.Getenv("PATH")
 	t.Setenv("PATH", projectRoot+string(os.PathListSeparator)+originalPath)
 
@@ -430,4 +427,23 @@ func findDoctorCheck(t *testing.T, checks []DoctorCheck, name string) DoctorChec
 	}
 	t.Fatalf("doctor check not found: %s", name)
 	return DoctorCheck{}
+}
+
+func writeGitStub(t *testing.T, dir string, stdout string) {
+	t.Helper()
+
+	if os.PathSeparator == '\\' {
+		gitScript := filepath.Join(dir, "git.cmd")
+		content := "@echo off\r\n" + "echo " + stdout
+		if err := os.WriteFile(gitScript, []byte(content), 0o644); err != nil {
+			t.Fatalf("write git stub: %v", err)
+		}
+		return
+	}
+
+	gitScript := filepath.Join(dir, "git")
+	content := "#!/bin/sh\nprintf '%s' \"" + stdout + "\"\n"
+	if err := os.WriteFile(gitScript, []byte(content), 0o755); err != nil {
+		t.Fatalf("write git stub: %v", err)
+	}
 }
