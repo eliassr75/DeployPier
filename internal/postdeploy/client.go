@@ -17,6 +17,7 @@ import (
 	"github.com/deploypier/deploypier/internal/build"
 	"github.com/deploypier/deploypier/internal/config"
 	"github.com/deploypier/deploypier/internal/status"
+	"github.com/deploypier/deploypier/internal/version"
 )
 
 type Client struct {
@@ -79,7 +80,7 @@ func (c *Client) Call(ctx context.Context, cfg config.Config, release build.Rele
 		},
 		Meta: map[string]interface{}{
 			"tool":         "deploypier",
-			"tool_version": "0.1.0",
+			"tool_version": version.String,
 		},
 	}
 

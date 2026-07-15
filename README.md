@@ -173,11 +173,88 @@ Para usar a CLI em um projeto Laravel:
 
 ## Instalação
 
-O projeto não instala o comando `deploypier` no `PATH` do sistema automaticamente.
+O projeto não instala o comando `deploypier` no `PATH` automaticamente.
 
-Hoje você pode usar a CLI de três formas.
+Para uso real no dia a dia, o caminho recomendado é:
 
-### 1. Rodar com Go sem instalar binário
+1. baixar ou compilar o binário uma vez
+2. colocar esse binário em uma pasta global
+3. adicionar essa pasta ao `PATH`
+4. usar `deploypier ...` em qualquer projeto
+
+Isso evita recompilar a ferramenta dentro de cada aplicação Laravel e evita exigir Go na máquina de quem só quer usar a CLI.
+
+### Opção recomendada: binário global no `PATH`
+
+#### Windows
+
+Compile ou baixe o `deploypier.exe` e coloque em uma pasta como:
+
+```text
+C:\Tools\DeployPier\
+```
+
+Depois adicione essa pasta ao `PATH` do usuário ou do sistema.
+
+Exemplo de compilação local:
+
+```powershell
+go build -o deploypier.exe .
+```
+
+Depois de copiar o binário para a pasta global:
+
+```powershell
+deploypier help
+deploypier init-locaweb -project-root C:\caminho\app -ftp-user meuusuarioftp
+```
+
+#### Linux
+
+Compile ou baixe o binário `deploypier` e copie para um diretório global, como:
+
+```bash
+sudo install -m 0755 deploypier /usr/local/bin/deploypier
+```
+
+Ou para uso apenas do usuário atual:
+
+```bash
+mkdir -p ~/.local/bin
+install -m 0755 deploypier ~/.local/bin/deploypier
+```
+
+Depois:
+
+```bash
+deploypier help
+deploypier init-locaweb -project-root /path/to/app -ftp-user meuusuarioftp
+```
+
+#### macOS
+
+No macOS, o fluxo é o mesmo:
+
+```bash
+sudo install -m 0755 deploypier /usr/local/bin/deploypier
+```
+
+Em máquinas com Homebrew no Apple Silicon, um diretório comum para binários globais também é:
+
+```text
+/opt/homebrew/bin
+```
+
+Depois:
+
+```bash
+deploypier help
+deploypier init-locaweb -project-root /path/to/app -ftp-user meuusuarioftp
+```
+
+### Opção para desenvolvimento: rodar com Go sem instalar
+
+Se você está desenvolvendo a própria ferramenta, pode rodar direto com Go:
 
 ```bash
 go run . help
@@ -189,7 +266,7 @@ Para executar um comando real:
 go run . init-locaweb -project-root . -ftp-user meuusuarioftp
 ```
 
-### 2. Compilar o binário e usar no diretório atual
+### Opção local: compilar e usar no diretório atual
 
 ```bash
 go build -o deploypier .
@@ -208,9 +285,50 @@ go build -o deploypier.exe .
 .\deploypier.exe init-locaweb -project-root C:\caminho\app -ftp-user meuusuarioftp
 ```
 
-### 3. Colocar o binário em um diretório do `PATH`
+### Distribuição recomendada do projeto
 
-Se você quiser usar `deploypier ...` de qualquer pasta, aí sim precisa copiar o binário para um diretório que já esteja no `PATH` do seu sistema, ou adicionar esse diretório manualmente.
+Para publicar o `DeployPier` de forma profissional, o fluxo mais simples é:
+
+1. gerar binários para `windows`, `linux` e `macos`
+2. anexar esses artefatos no GitHub Releases
+3. documentar a instalação via `PATH`
+4. deixar Go como dependência apenas para quem for contribuir no código-fonte
+
+O repositório já pode seguir esse modelo com GitHub Actions: ao criar uma tag no formato `vX.Y.Z`, o workflow de release gera os binários, empacota os artefatos e publica tudo no GitHub Releases com `checksums.txt`.
+
+Nessa publicação por tag, o binário também recebe a versão da release no comando:
+
+```bash
+deploypier version
+```
+
+Exemplo esperado para uma tag `v0.1.0`:
+
+```text
+v0.1.0
+```
+
+Exemplo de builds multiplataforma:
+
+```bash
+GOOS=windows GOARCH=amd64 go build -o dist/deploypier-windows-amd64.exe .
+GOOS=linux GOARCH=amd64 go build -o dist/deploypier-linux-amd64 .
+GOOS=linux GOARCH=arm64 go build -o dist/deploypier-linux-arm64 .
+GOOS=darwin GOARCH=amd64 go build -o dist/deploypier-darwin-amd64 .
+GOOS=darwin GOARCH=arm64 go build -o dist/deploypier-darwin-arm64 .
+```
+
+No PowerShell:
+
+```powershell
+$env:GOOS="windows"; $env:GOARCH="amd64"; go build -o dist/deploypier-windows-amd64.exe .
+$env:GOOS="linux"; $env:GOARCH="amd64"; go build -o dist/deploypier-linux-amd64 .
+$env:GOOS="linux"; $env:GOARCH="arm64"; go build -o dist/deploypier-linux-arm64 .
+$env:GOOS="darwin"; $env:GOARCH="amd64"; go build -o dist/deploypier-darwin-amd64 .
+$env:GOOS="darwin"; $env:GOARCH="arm64"; go build -o dist/deploypier-darwin-arm64 .
+Remove-Item Env:\GOOS
+Remove-Item Env:\GOARCH
+```
 
 Os exemplos abaixo assumem que:
 
