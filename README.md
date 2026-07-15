@@ -34,12 +34,6 @@ Já implementado:
 - scaffold de bootstrap/documentação para Locaweb
 - política de auto-migration fail-closed e bem mais restrita
 
-Limites conhecidos deste corte:
-
-- ainda não existe smoke check HTTP automatizado depois do deploy
-- o caminho de ativação preserva explicitamente `public_html/storage`, mas não preserva outros arquivos manuais fora do artefato
-- faltam testes de integração reais contra servidores FTPS/SFTP em CI
-
 ## Como o deploy funciona
 
 No modo padrão `release-based`, o fluxo é:
@@ -325,14 +319,6 @@ Para validar o receiver Laravel no projeto integrado:
 ```bash
 php artisan test tests/Feature/Infrastructure/DeployHookReceiverTest.php tests/Unit/Deploy/DeployHookSignatureServiceTest.php
 ```
-
-## O que eu ainda revisaria antes de divulgação pesada
-
-Se a ideia é abrir o GitHub agora, já está em um estado bem mais sólido. Para uma divulgação mais agressiva, eu ainda priorizaria:
-
-- smoke check HTTP pós-deploy
-- testes de integração FTPS/SFTP automatizados
-- política opcional para preservar outros arquivos manuais dentro de `public_html`
 
 ## Licença
 
