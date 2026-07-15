@@ -124,3 +124,13 @@ func TestValidateRejectsMissingHookCommand(t *testing.T) {
 		t.Fatalf("expected validation error")
 	}
 }
+
+func TestValidateAcceptsBypassPostDeployMode(t *testing.T) {
+	cfg := defaults(t.TempDir())
+	cfg.PostDeploy.Mode = "bypass"
+	normalizeRuntime(&cfg)
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected bypass mode to be accepted: %v", err)
+	}
+}

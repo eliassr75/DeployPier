@@ -146,7 +146,7 @@ No modo padrão `release-based`, o fluxo é:
 7. verificação remota do manifesto
 8. sincronização dos assets públicos para `public_html`, preservando `index.php` e `storage`
 9. atualização do estado remoto e do ponteiro de release atual em `.deploypier/current.txt`
-10. hook Laravel assinado, quando `post_deploy.mode=auto`
+10. hook Laravel assinado, quando `post_deploy.mode=auto` ou `post_deploy.mode=bypass`
 
 No rollback, a CLI reativa a release anterior registrada no estado remoto e recompõe o `public_html` com os assets daquela release.
 
@@ -580,6 +580,8 @@ post_deploy:
 Quando `mode=auto`, a CLI só aceita migrations bem aditivas e curtas. Se o diff não puder ser avaliado, ou se aparecer qualquer migration fora da allowlist, o caminho automático é bloqueado antes da promoção.
 
 Em `mode=manual`, o deploy de código pode seguir, mas o resultado volta como `needs_manual_migration` quando houver migration detectada.
+
+Em `mode=bypass`, o DeployPier chama o hook de pós-deploy mesmo quando a política de migrations barraria o `auto`. Esse modo existe justamente para forçar `migrate --force` de forma consciente e explícita, então ele deve ser usado só quando você já revisou o impacto da migration.
 
 ## Locaweb
 

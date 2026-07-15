@@ -446,8 +446,8 @@ func (c Config) Validate() error {
 	if c.PostDeploy.Mode == "" {
 		problems = append(problems, "post_deploy.mode is required")
 	}
-	if c.PostDeploy.Mode != "" && !contains([]string{"auto", "manual", "skip"}, c.PostDeploy.Mode) {
-		problems = append(problems, "post_deploy.mode must be one of auto, manual, skip")
+	if c.PostDeploy.Mode != "" && !contains([]string{"auto", "manual", "skip", "bypass"}, c.PostDeploy.Mode) {
+		problems = append(problems, "post_deploy.mode must be one of auto, manual, skip, bypass")
 	}
 	if c.State.File == "" {
 		problems = append(problems, "state.file is required")

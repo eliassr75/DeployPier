@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"github.com/deploypier/deploypier/internal/build"
 	"github.com/deploypier/deploypier/internal/config"
 	"github.com/deploypier/deploypier/internal/hooks"
+	"github.com/deploypier/deploypier/internal/postdeploy"
 	"github.com/deploypier/deploypier/internal/state"
 	"github.com/deploypier/deploypier/internal/status"
 	"github.com/deploypier/deploypier/internal/transport"
@@ -399,6 +402,107 @@ return new class {
 	}
 	if len(result.Warnings) == 0 {
 		t.Fatalf("expected manual migration warning")
+	}
+}
+
+func TestPushBypassModeRunsPostDeployDespiteBlockedMigrationPolicy(t *testing.T) {
+	tempDir := t.TempDir()
+	store := state.New(filepath.Join(tempDir, "state.json"))
+
+	release := build.Release{
+		ID:   "rel-bypass-1",
+		Path: filepath.Join(tempDir, "releases", "rel-bypass-1"),
+		Manifest: build.Manifest{
+			ReleaseID: "rel-bypass-1",
+		},
+	}
+	if err := store.RecordBuild(context.Background(), state.BuildRecord{
+		ReleaseID: release.ID,
+		Path:      release.Path,
+		BuiltAt:   "2026-07-15T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("record build: %v", err)
+	}
+
+	projectRoot := filepath.Join(tempDir, "project")
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectRoot, "database", "migrations"), 0o755); err != nil {
+		t.Fatalf("mkdir migrations: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, "database", "migrations", "2026_07_15_000001_alter_widgets_table.php"), []byte(`<?php
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+return new class {
+    public function up(): void
+    {
+        Schema::table('widgets', function (Blueprint $table) {
+            $table->string('name')->nullable();
+        });
+    }
+};`), 0o644); err != nil {
+		t.Fatalf("write migration: %v", err)
+	}
+
+	writeGitStub(t, projectRoot, "database/migrations/2026_07_15_000001_alter_widgets_table.php\n")
+	originalPath := os.Getenv("PATH")
+	t.Setenv("PATH", projectRoot+string(os.PathListSeparator)+originalPath)
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	builder := &fakeBuilder{loadRelease: release}
+	transportImpl := &fakeTransport{}
+	activator := &fakeActivator{}
+	hooksRunner := &fakeHooks{}
+	service := &Service{
+		cfg: config.Config{
+			Project: config.ProjectConfig{Root: projectRoot, Name: "demo"},
+			Transport: config.TransportConfig{
+				Path: "/",
+			},
+			Remote: config.RemoteConfig{
+				AppRoot: "/app",
+				Layout:  "release-based",
+			},
+			PostDeploy: config.PostDeployConfig{
+				Mode:    "bypass",
+				HookURL: server.URL,
+				KeyID:   "test-key",
+				Secret:  "test-secret",
+			},
+		},
+		builder:    builder,
+		store:      store,
+		transport:  transportImpl,
+		activator:  activator,
+		hooks:      hooksRunner,
+		postDeploy: postdeploy.NewClient(),
+		now:        func() time.Time { return time.Date(2026, 7, 15, 10, 5, 0, 0, time.UTC) },
+	}
+
+	result, err := service.Push(context.Background(), release.ID, false)
+	if err != nil {
+		t.Fatalf("push service: %v", err)
+	}
+
+	if result.Status != "success" {
+		t.Fatalf("expected success, got %s", result.Status)
+	}
+	if requests != 1 {
+		t.Fatalf("expected hook to run once, got %d", requests)
+	}
+	if len(result.Warnings) == 0 || !strings.Contains(strings.Join(result.Warnings, "\n"), "bypass") {
+		t.Fatalf("expected bypass warning, got %#v", result.Warnings)
 	}
 }
 

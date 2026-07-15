@@ -355,6 +355,10 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 		Status:    "success",
 		Warnings:  append([]string{}, assessment.Warnings...),
 	}
+	if s.cfg.PostDeploy.Mode == "bypass" && len(assessment.Blocking) > 0 {
+		result.Warnings = append(result.Warnings, "post-deploy bypass enabled; running hook despite migration policy blocks")
+		result.Warnings = append(result.Warnings, assessment.Blocking...)
+	}
 	beforePush, err := s.runHooks(ctx, "before_push", hooks.Metadata{
 		"release_id": release.ID,
 		"release":    release.Path,
@@ -451,7 +455,7 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 		result.Warnings = append(result.Warnings, "migration files detected but post-deploy mode is skip")
 	}
 
-	if s.cfg.PostDeploy.Mode == "auto" {
+	if s.cfg.PostDeploy.Mode == "auto" || s.cfg.PostDeploy.Mode == "bypass" {
 		ref, commit := currentGitMetadata(ctx, s.cfg.Project.Root)
 		if _, err := s.postDeploy.Call(ctx, s.cfg, release, upload.RemotePath, ref, commit); err != nil {
 			result.Status = "failed_post_deploy"
@@ -550,6 +554,9 @@ func (s *Service) postDeployReport() status.Report {
 	}
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(s.cfg.PostDeploy.HookURL)), "https://") {
 		return status.Report{Level: status.LevelFail, Code: "invalid_hook_url", Message: "post-deploy hook URL must use https"}
+	}
+	if s.cfg.PostDeploy.Mode == "bypass" {
+		return status.Report{Level: status.LevelWarn, Code: "bypass", Message: "post-deploy hook will run with migration policy bypass enabled"}
 	}
 	return status.Report{Level: status.LevelOK, Code: "ok", Message: "post-deploy hook configured"}
 }
