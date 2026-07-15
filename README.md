@@ -83,15 +83,27 @@ Isso gera:
 
 Copie `.deploy.env.example` para `.deploy.env` e preencha as credenciais e paths do host.
 
-Antes do primeiro deploy, adapte o `public_html/index.php` do projeto usando `docs/deploypier-public-index.php.example` como base.
+No primeiro `deploypier doctor`, se o `public_html/index.php` remoto ainda não existir, o DeployPier cria automaticamente um bootstrap estável compatível com `.deploypier/current.txt`, usando os paths de `runtime.*`.
 
-O objetivo desse arquivo é manter um front controller estável, que lê a release ativa a partir de `.deploypier/current.txt`.
+O arquivo `docs/deploypier-public-index.php.example` continua no projeto como referência para revisão ou customização manual quando você quiser adaptar um front controller já existente.
 
 ### 3. Validar a configuração
 
 ```bash
+deploypier inspect-remote -config ./deploy.yml
 deploypier doctor -config ./deploy.yml
 ```
+
+O `inspect-remote` tenta descobrir o diretório remoto atual via FTPS/SFTP e sugere valores para:
+
+- `transport.path`
+- `remote.app_root`
+- `remote.public_root`
+- `activation.current_pointer`
+- `runtime.app_root`
+- `runtime.current_pointer`
+
+Isso ajuda bastante em hospedagens como a Locaweb, onde o path do FTP pode ser chrootado e diferir do path absoluto que o PHP enxerga no servidor.
 
 ### 4. Gerar a release local
 
@@ -129,12 +141,25 @@ No modo padrão `release-based`, o fluxo é:
 2. empacotamento por allowlist
 3. geração de `manifest.json`
 4. upload da release para `app/releases/<release_id>`
-5. verificação remota do manifesto
-6. sincronização dos assets públicos para `public_html`, preservando `index.php` e `storage`
-7. atualização do estado remoto e do ponteiro de release atual em `.deploypier/current.txt`
-8. hook Laravel assinado, quando `post_deploy.mode=auto`
+5. seed inicial do `.env` remoto a partir de `env.production` ou `.env.production`, apenas quando a hospedagem ainda não tiver `.env`
+6. cópia do `.env` compartilhado para a release enviada
+7. verificação remota do manifesto
+8. sincronização dos assets públicos para `public_html`, preservando `index.php` e `storage`
+9. atualização do estado remoto e do ponteiro de release atual em `.deploypier/current.txt`
+10. hook Laravel assinado, quando `post_deploy.mode=auto`
 
 No rollback, a CLI reativa a release anterior registrada no estado remoto e recompõe o `public_html` com os assets daquela release.
+
+## Paths de transporte vs runtime
+
+O `DeployPier` passa a tratar dois grupos de path:
+
+- `transport.path`, `remote.app_root`, `remote.public_root` e `activation.current_pointer`
+  - são paths usados pelo transporte FTPS/SFTP/FTP
+- `runtime.app_root` e `runtime.current_pointer`
+  - são paths absolutos usados pelo PHP dentro do `public_html/index.php`
+
+Em shared hosting isso importa porque o FTP pode estar preso em uma raiz chrootada, como `/`, enquanto o PHP ainda precisa de um path absoluto real, como `/home/storage/.../usuario/app`.
 
 ## Quando usar `-release`
 
@@ -389,6 +414,14 @@ deploypier rollback -config ./deploy.yml
 deploypier rollback -config ./deploy.yml -release 20260715T101500Z
 ```
 
+### `inspect-remote`
+
+Inspeciona o diretório remoto atual e sugere os principais paths do `deploy.yml`.
+
+```bash
+deploypier inspect-remote -config ./deploy.yml
+```
+
 ### `install-laravel-hook`
 
 Gera a estrutura Laravel para receber o hook assinado de pós-deploy.
@@ -460,6 +493,10 @@ remote:
   public_root: "/home/ftp-user/public_html"
   layout: "release-based"
 
+runtime:
+  app_root: "/home/ftp-user/app"
+  current_pointer: "/home/ftp-user/.deploypier/current.txt"
+
 post_deploy:
   mode: "manual"
   hook_url_env: "DEPLOY_HOOK_URL"
@@ -489,6 +526,8 @@ DEPLOY_PASSWORD=
 DEPLOY_PRIVATE_KEY=
 DEPLOY_REMOTE_APP_ROOT=
 DEPLOY_REMOTE_PUBLIC_ROOT=
+DEPLOY_RUNTIME_APP_ROOT=
+DEPLOY_RUNTIME_CURRENT_POINTER=
 DEPLOY_HOOK_URL=
 DEPLOY_HOOK_KEY_ID=
 DEPLOY_HOOK_SECRET=
@@ -501,6 +540,8 @@ DEPLOYPIER_TRANSPORT_KNOWN_HOSTS=
 ```
 
 Você pode usar `.deploy.env` localmente. A CLI carrega esse arquivo automaticamente quando ele estiver ao lado do `deploy.yml`.
+
+Se o projeto tiver `env.production` ou `.env.production` na raiz local, o `push` usa esse arquivo apenas como seed inicial do `.env` remoto. Isso só acontece quando a hospedagem ainda não tiver um `.env` na raiz configurada por `transport.path`. Depois disso, cada release recebe uma cópia do `.env` remoto existente, sem sobrescrever o original do host.
 
 ## Hook Laravel
 
@@ -550,7 +591,7 @@ O bootstrap gerado cobre tarefas que normalmente acabam sendo feitas manualmente
 - usar `composer.phar` manualmente quando necessário
 - recriar o symlink `public_html/storage`
 
-No modo `release-based`, o `public_html/index.php` deve ficar estável e ler a release ativa usando `.deploypier/current.txt`. O `DeployPier` não sobrescreve automaticamente um `index.php` já customizado pelo projeto.
+No modo `release-based`, o `public_html/index.php` deve ficar estável e ler a release ativa usando `.deploypier/current.txt`. Nesse arquivo, use os paths de `runtime`, não os paths de transporte. Se o arquivo remoto ainda não existir, o `doctor` gera esse bootstrap automaticamente. Se ele já existir e estiver customizado, o DeployPier não o sobrescreve.
 
 ## Segurança
 

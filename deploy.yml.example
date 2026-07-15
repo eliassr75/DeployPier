@@ -42,6 +42,10 @@ remote:
   public_root: "/home/ftp-user/public_html"
   layout: "release-based"
 
+runtime:
+  app_root: "/home/ftp-user/app"
+  current_pointer: "/home/ftp-user/.deploypier/current.txt"
+
 post_deploy:
   mode: "manual"
   hook_url_env: "DEPLOY_HOOK_URL"
