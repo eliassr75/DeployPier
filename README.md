@@ -186,15 +186,31 @@ Isso evita recompilar a ferramenta dentro de cada aplicação Laravel e evita ex
 
 ### Opção recomendada: binário global no `PATH`
 
-#### Windows
+Se você já tem um binário local do `DeployPier`, a forma mais simples de automatizar isso é:
 
-Compile ou baixe o `deploypier.exe` e coloque em uma pasta como:
-
-```text
-C:\Tools\DeployPier\
+```bash
+deploypier install-self
 ```
 
-Depois adicione essa pasta ao `PATH` do usuário ou do sistema.
+Esse comando:
+
+- copia o binário atual para o diretório padrão do usuário
+- tenta registrar esse diretório no `PATH`
+- informa quando é preciso reabrir o terminal
+
+Flags úteis:
+
+- `deploypier install-self -force`
+- `deploypier install-self -skip-path`
+- `deploypier install-self -target-dir /caminho/customizado`
+
+#### Windows
+
+O `deploypier install-self` instala por padrão em algo como:
+
+```text
+%LOCALAPPDATA%\Programs\DeployPier\
+```
 
 Exemplo de compilação local:
 
@@ -202,54 +218,38 @@ Exemplo de compilação local:
 go build -o deploypier.exe .
 ```
 
-Depois de copiar o binário para a pasta global:
+Depois:
 
 ```powershell
-deploypier help
-deploypier init-locaweb -project-root C:\caminho\app -ftp-user meuusuarioftp
+.\deploypier.exe install-self
 ```
 
 #### Linux
 
-Compile ou baixe o binário `deploypier` e copie para um diretório global, como:
+O `deploypier install-self` instala por padrão em:
 
 ```bash
-sudo install -m 0755 deploypier /usr/local/bin/deploypier
-```
-
-Ou para uso apenas do usuário atual:
-
-```bash
-mkdir -p ~/.local/bin
-install -m 0755 deploypier ~/.local/bin/deploypier
+~/.local/bin
 ```
 
 Depois:
 
 ```bash
-deploypier help
-deploypier init-locaweb -project-root /path/to/app -ftp-user meuusuarioftp
+./deploypier install-self
 ```
 
 #### macOS
 
-No macOS, o fluxo é o mesmo:
-
-```bash
-sudo install -m 0755 deploypier /usr/local/bin/deploypier
-```
-
-Em máquinas com Homebrew no Apple Silicon, um diretório comum para binários globais também é:
+No macOS, o comando também usa por padrão:
 
 ```text
-/opt/homebrew/bin
+~/.local/bin
 ```
 
 Depois:
 
 ```bash
-deploypier help
-deploypier init-locaweb -project-root /path/to/app -ftp-user meuusuarioftp
+./deploypier install-self
 ```
 
 ### Opção para desenvolvimento: rodar com Go sem instalar

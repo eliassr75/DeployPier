@@ -40,6 +40,8 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer,
 		return runPush(ctx, args[1:], stdout, env, cwd)
 	case "rollback":
 		return runRollback(ctx, args[1:], stdout, env, cwd)
+	case "install-self":
+		return runInstallSelf(args[1:], stdout)
 	case "install-laravel-hook":
 		return runInstallLaravelHook(args[1:], stdout, cwd)
 	case "install-locaweb-bootstrap":
@@ -198,6 +200,57 @@ func runRollback(ctx context.Context, args []string, stdout io.Writer, env []str
 
 	_, err = fmt.Fprintf(stdout, "activated_path: %s\n", activatedPath)
 	return err
+}
+
+func runInstallSelf(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("install-self", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	targetDir := flags.String("target-dir", "", "directory where the deploypier binary should be installed")
+	skipPath := flags.Bool("skip-path", false, "do not try to register the install directory in PATH")
+	force := flags.Bool("force", false, "overwrite the installed binary when it already exists")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	installer := install.NewSelfInstaller()
+	result, err := installer.Install(*targetDir, !*skipPath, *force)
+	if err != nil {
+		return err
+	}
+
+	if _, err := fmt.Fprintf(stdout, "installed_path: %s\ntarget_dir: %s\n", result.InstalledPath, result.TargetDir); err != nil {
+		return err
+	}
+	switch {
+	case result.PathUpdated:
+		if _, err := fmt.Fprintf(stdout, "path_status: updated\n"); err != nil {
+			return err
+		}
+	case result.AlreadyInPath:
+		if _, err := fmt.Fprintf(stdout, "path_status: already_available\n"); err != nil {
+			return err
+		}
+	default:
+		if _, err := fmt.Fprintf(stdout, "path_status: skipped\n"); err != nil {
+			return err
+		}
+	}
+	if result.PathMode != "" {
+		if _, err := fmt.Fprintf(stdout, "path_mode: %s\n", result.PathMode); err != nil {
+			return err
+		}
+	}
+	if result.ProfilePath != "" {
+		if _, err := fmt.Fprintf(stdout, "profile_path: %s\n", result.ProfilePath); err != nil {
+			return err
+		}
+	}
+	if result.RestartRequired {
+		if _, err := fmt.Fprintln(stdout, "note: reopen the terminal session so the updated PATH becomes available."); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runInstallLaravelHook(args []string, stdout io.Writer, cwd string) error {
@@ -407,6 +460,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  build     Create a local release bundle and manifest")
 	fmt.Fprintln(w, "  push      Upload a release and optionally activate it")
 	fmt.Fprintln(w, "  rollback  Activate the previous or requested release")
+	fmt.Fprintln(w, "  install-self  Install the current DeployPier binary in a user PATH directory")
 	fmt.Fprintln(w, "  init-locaweb  Generate deploy.yml and environment examples for Locaweb")
 	fmt.Fprintln(w, "  install-laravel-hook  Generate the Laravel receiver files in a target project")
 	fmt.Fprintln(w, "  install-locaweb-bootstrap  Generate first-time Locaweb bootstrap scripts")
