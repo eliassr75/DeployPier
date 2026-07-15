@@ -36,6 +36,86 @@ Já implementado:
 - scaffold de bootstrap/documentação para Locaweb
 - política de auto-migration fail-closed e bem mais restrita
 
+## Conceitos rápidos
+
+Antes de usar a CLI, vale alinhar três termos:
+
+- `build`: é a etapa local que roda Composer e Node, monta a pasta da release e gera o `manifest.json`
+- `release`: é um pacote versionado do seu projeto, gerado automaticamente pela CLI com um `release_id` no formato de timestamp
+- `ativação`: é o momento em que a release enviada passa a ser a versão pública do site
+
+Na prática, `ativar` significa trocar o que está servindo em `public_html` para apontar para a release nova.
+
+Você não precisa informar `release` manualmente no fluxo normal. O comportamento padrão é:
+
+1. você roda `build`
+2. a CLI gera a release mais recente
+3. você roda `push`
+4. o `push` usa automaticamente a última release gerada
+
+O parâmetro `-release` existe só para casos específicos, como:
+
+- publicar uma release antiga que já foi gerada localmente
+- repetir o envio de uma release específica
+- fazer rollback direcionado
+
+## Primeiro deploy
+
+Se você quer usar a ferramenta sem pensar muito na arquitetura primeiro, o caminho mais comum é este:
+
+### 1. Gerar os arquivos iniciais do projeto
+
+```bash
+deploypier init-locaweb -project-root . -ftp-user meuusuarioftp
+deploypier install-laravel-hook -project-root .
+deploypier install-locaweb-bootstrap -project-root . -ftp-user meuusuarioftp
+```
+
+Isso gera:
+
+- `deploy.yml`
+- `.deploy.env.example`
+- integração Laravel para o hook de pós-deploy
+- scripts de bootstrap/manual para Locaweb
+
+### 2. Preparar o ambiente local
+
+Copie `.deploy.env.example` para `.deploy.env` e preencha as credenciais e paths do host.
+
+### 3. Validar a configuração
+
+```bash
+deploypier doctor -config ./deploy.yml
+```
+
+### 4. Gerar a release local
+
+```bash
+deploypier build -config ./deploy.yml
+```
+
+Esse comando:
+
+- roda o build local
+- gera uma pasta em `.deploypier/releases/<release_id>`
+- cria o `manifest.json`
+
+### 5. Publicar
+
+```bash
+deploypier push -config ./deploy.yml
+```
+
+Sem passar `-release`, a CLI usa automaticamente a última release gerada no passo anterior.
+
+### 6. Se precisar voltar
+
+```bash
+deploypier rollback -config ./deploy.yml
+```
+
+Esse comando tenta reativar a release anterior registrada no estado remoto.
+
 ## Como o deploy funciona
 
 No modo padrão `release-based`, o fluxo é:
@@ -53,17 +133,23 @@ No modo padrão `release-based`, o fluxo é:
 
 No rollback, a CLI reativa a release anterior registrada no estado remoto e recompõe o `public_html` com os assets daquela release.
 
-## Fluxo rápido
+## Quando usar `-release`
 
-Para um projeto Laravel novo nesse cenário, o caminho mais comum é:
+Você só precisa informar `-release` manualmente quando quiser fugir do fluxo padrão.
 
-1. gerar a configuração inicial com `init-locaweb`
-2. gerar o receiver Laravel com `install-laravel-hook`
-3. gerar o bootstrap Locaweb com `install-locaweb-bootstrap`
-4. preparar as variáveis em `.deploy.env`
-5. rodar `doctor`
-6. rodar `build`
-7. rodar `push`
+Exemplo:
+
+```bash
+deploypier push -config ./deploy.yml -release 20260715T101500Z
+```
+
+Casos típicos:
+
+- você já gerou mais de uma release local e quer escolher exatamente qual publicar
+- você quer republicar uma release específica
+- você quer testar uma release sem gerar outra nova antes
+
+Se você está fazendo o fluxo normal de `build` seguido de `push`, não precisa informar nada manualmente.
 
 ## Por que Go
 
