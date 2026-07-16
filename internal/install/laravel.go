@@ -285,6 +285,7 @@ SYSTEM_DEPLOY_RECEIVER_SECRET=
 SYSTEM_DEPLOY_RECEIVER_SIGNATURE_VERSION=v1
 SYSTEM_DEPLOY_RECEIVER_SIGNATURE_SCOPE=deploy:post-deploy
 SYSTEM_DEPLOY_RECEIVER_REPLAY_TOLERANCE_SECONDS=300
+SYSTEM_DEPLOY_RECEIVER_REQUEST_TIMEOUT_SECONDS=900
 SYSTEM_DEPLOY_RECEIVER_LOCK_SECONDS=900
 SYSTEM_DEPLOY_RECEIVER_LOCK_KEY=deploypier:receiver
 SYSTEM_DEPLOY_RECEIVER_QUEUE_RESTART=true
@@ -300,6 +301,7 @@ return [
     'signature_version' => env('SYSTEM_DEPLOY_RECEIVER_SIGNATURE_VERSION', 'v1'),
     'signature_scope' => env('SYSTEM_DEPLOY_RECEIVER_SIGNATURE_SCOPE', 'deploy:post-deploy'),
     'replay_tolerance_seconds' => max(5, (int) env('SYSTEM_DEPLOY_RECEIVER_REPLAY_TOLERANCE_SECONDS', 300)),
+    'request_timeout_seconds' => max(30, (int) env('SYSTEM_DEPLOY_RECEIVER_REQUEST_TIMEOUT_SECONDS', 900)),
     'lock_seconds' => max(5, (int) env('SYSTEM_DEPLOY_RECEIVER_LOCK_SECONDS', 900)),
     'lock_key' => env('SYSTEM_DEPLOY_RECEIVER_LOCK_KEY', 'deploypier:receiver'),
     'queue_restart' => filter_var(env('SYSTEM_DEPLOY_RECEIVER_QUEUE_RESTART', true), FILTER_VALIDATE_BOOL),
@@ -379,11 +381,12 @@ class ReceiveDeployHookRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'operation' => ['required', 'string', Rule::in(['post_deploy_v1'])],
+            'operation' => ['required', 'string', Rule::in(['post_deploy_v1', 'prepare_release_v1', 'extract_release_v1'])],
             'environment' => ['nullable', 'string', 'max:80'],
             'app' => ['nullable', 'string', 'max:120'],
             'mode' => ['nullable', 'string', Rule::in(['release-based', 'in-place'])],
             'release_id' => ['required', 'string', 'max:120', 'regex:/^[A-Za-z0-9._\\/-]+$/'],
+            'base_release_id' => ['nullable', 'string', 'max:120', 'regex:/^[A-Za-z0-9._\\/-]+$/'],
             'ref' => ['nullable', 'string', 'max:120', 'regex:/^[A-Za-z0-9._\\/-]+$/'],
             'commit' => ['nullable', 'string', 'max:64', 'regex:/^[a-f0-9]{7,64}$/i'],
             'triggered_at' => ['required', 'date'],
@@ -391,6 +394,12 @@ class ReceiveDeployHookRequest extends FormRequest
             'artifact.sha256' => ['nullable', 'string', 'size:64', 'regex:/^[a-f0-9]{64}$/i'],
             'artifact.size' => ['nullable', 'integer', 'min:0'],
             'artifact.uploaded_path' => ['nullable', 'string', 'max:1000'],
+            'artifact.archive_sha256' => ['nullable', 'string', 'size:64', 'regex:/^[a-f0-9]{64}$/i'],
+            'artifact.archive_size' => ['nullable', 'integer', 'min:0'],
+            'remove_paths' => ['nullable', 'array'],
+            'remove_paths.*' => ['string', 'max:1000', 'regex:/^(?!\\.|\\/)(?!.*\\.\\.)(?!.*\\/\\.)(?!.*\\/$)[A-Za-z0-9_\\.\\-\\/]+$/'],
+            'changed_paths' => ['nullable', 'array'],
+            'changed_paths.*' => ['string', 'max:1000', 'regex:/^(?!\\.|\\/)(?!.*\\.\\.)(?!.*\\/\\.)(?!.*\\/$)[A-Za-z0-9_\\.\\-\\/]+$/'],
             'meta' => ['nullable', 'array'],
         ];
     }
@@ -626,6 +635,8 @@ namespace App\Services\Deploy;
 
 use Illuminate\Support\Facades\Artisan;
 use RuntimeException;
+use SplFileInfo;
+use ZipArchive;
 
 class DeployHookPipelineService
 {
@@ -663,6 +674,109 @@ class DeployHookPipelineService
         return $results;
     }
 
+    public function prepareRelease(string $releaseId, ?string $baseReleaseId = null, array $removePaths = []): array
+    {
+        $startedAt = now();
+        $sourcePath = base_path();
+        $sourceReleaseId = basename($sourcePath);
+        $releaseRoot = dirname($sourcePath);
+        $targetPath = $releaseRoot.DIRECTORY_SEPARATOR.$releaseId;
+
+        if ($baseReleaseId !== null && trim($baseReleaseId) !== '' && trim($baseReleaseId) !== $sourceReleaseId) {
+            throw new RuntimeException(sprintf(
+                'A release ativa atual [%s] nao confere com a base esperada [%s].',
+                $sourceReleaseId,
+                trim($baseReleaseId),
+            ));
+        }
+
+        if (file_exists($targetPath)) {
+            throw new RuntimeException(sprintf('A release de destino [%s] ja existe no host.', $releaseId));
+        }
+
+        if (! is_dir($sourcePath)) {
+            throw new RuntimeException('O diretorio da release ativa nao foi encontrado.');
+        }
+
+        $copiedFiles = $this->copyTree($sourcePath, $targetPath);
+        $removedEntries = 0;
+        foreach ($removePaths as $relativePath) {
+            $removedEntries += $this->removeRelativePath($targetPath, (string) $relativePath);
+        }
+
+        return [[
+            'command' => 'prepare_release',
+            'parameters' => [
+                'release_id' => $releaseId,
+                'base_release_id' => $sourceReleaseId,
+                'remove_paths_count' => count($removePaths),
+            ],
+            'exit_code' => 0,
+            'output' => sprintf(
+                'Release %s preparada a partir de %s com %d arquivos copiados e %d caminhos removidos.',
+                $releaseId,
+                $sourceReleaseId,
+                $copiedFiles,
+                $removedEntries,
+            ),
+            'started_at' => $startedAt->toIso8601String(),
+            'finished_at' => now()->toIso8601String(),
+        ]];
+    }
+
+    public function extractRelease(string $releaseId, ?string $expectedArchiveSha256 = null, ?int $expectedArchiveSize = null): array
+    {
+        $startedAt = now();
+        $releasePath = dirname(base_path()).DIRECTORY_SEPARATOR.$releaseId;
+        $archivePath = $releasePath.DIRECTORY_SEPARATOR.'release.zip';
+
+        if (! is_file($archivePath)) {
+            throw new RuntimeException(sprintf('O arquivo [%s] nao foi encontrado para extracao.', $archivePath));
+        }
+
+        if ($expectedArchiveSize !== null && filesize($archivePath) !== $expectedArchiveSize) {
+            throw new RuntimeException('O tamanho do arquivo release.zip nao confere com o informado pela CLI.');
+        }
+
+        if ($expectedArchiveSha256 !== null && hash_file('sha256', $archivePath) !== strtolower($expectedArchiveSha256)) {
+            throw new RuntimeException('O hash SHA-256 do arquivo release.zip nao confere com o informado pela CLI.');
+        }
+
+        $zip = new ZipArchive();
+        $openStatus = $zip->open($archivePath);
+        if ($openStatus !== true) {
+            throw new RuntimeException(sprintf('Nao foi possivel abrir o arquivo [%s] (status %s).', $archivePath, (string) $openStatus));
+        }
+
+        try {
+            for ($index = 0; $index < $zip->numFiles; $index++) {
+                $entryName = (string) $zip->getNameIndex($index);
+                $this->assertSafeArchiveEntry($entryName);
+            }
+
+            if (! $zip->extractTo($releasePath)) {
+                throw new RuntimeException(sprintf('Falha ao extrair o arquivo [%s] em [%s].', $archivePath, $releasePath));
+            }
+        } finally {
+            $zip->close();
+        }
+
+        if (! @unlink($archivePath)) {
+            throw new RuntimeException(sprintf('Falha ao remover o arquivo temporario [%s] apos a extracao.', $archivePath));
+        }
+
+        return [[
+            'command' => 'extract_release',
+            'parameters' => [
+                'release_id' => $releaseId,
+            ],
+            'exit_code' => 0,
+            'output' => sprintf('Arquivo release.zip extraido com sucesso para a release %s.', $releaseId),
+            'started_at' => $startedAt->toIso8601String(),
+            'finished_at' => now()->toIso8601String(),
+        ]];
+    }
+
     protected function runCommand(string $command, array $parameters = []): array
     {
         $startedAt = now();
@@ -698,6 +812,113 @@ class DeployHookPipelineService
 
         return (string) config('queue.default', 'sync') !== 'sync';
     }
+
+    protected function copyTree(string $sourcePath, string $targetPath): int
+    {
+        $entries = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($sourcePath, \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::SELF_FIRST,
+        );
+
+        if (! is_dir($targetPath) && ! mkdir($targetPath, 0755, true) && ! is_dir($targetPath)) {
+            throw new RuntimeException(sprintf('Nao foi possivel criar a release de destino [%s].', $targetPath));
+        }
+
+        $copiedFiles = 0;
+        foreach ($entries as $entry) {
+            if (! $entry instanceof SplFileInfo) {
+                continue;
+            }
+
+            $relativePath = ltrim(str_replace('\\', '/', substr($entry->getPathname(), strlen($sourcePath))), '/');
+            if ($relativePath === '') {
+                continue;
+            }
+
+            $targetEntryPath = $targetPath.DIRECTORY_SEPARATOR.str_replace('/', DIRECTORY_SEPARATOR, $relativePath);
+            if ($entry->isDir()) {
+                if (! is_dir($targetEntryPath) && ! mkdir($targetEntryPath, 0755, true) && ! is_dir($targetEntryPath)) {
+                    throw new RuntimeException(sprintf('Nao foi possivel criar o diretorio [%s].', $targetEntryPath));
+                }
+                continue;
+            }
+
+            $targetDir = dirname($targetEntryPath);
+            if (! is_dir($targetDir) && ! mkdir($targetDir, 0755, true) && ! is_dir($targetDir)) {
+                throw new RuntimeException(sprintf('Nao foi possivel preparar o diretorio [%s].', $targetDir));
+            }
+
+            if (! copy($entry->getPathname(), $targetEntryPath)) {
+                throw new RuntimeException(sprintf('Nao foi possivel copiar [%s] para [%s].', $entry->getPathname(), $targetEntryPath));
+            }
+            $copiedFiles++;
+        }
+
+        return $copiedFiles;
+    }
+
+    protected function removeRelativePath(string $targetPath, string $relativePath): int
+    {
+        $normalized = $this->normalizeRelativePath($relativePath);
+        if ($normalized === '') {
+            return 0;
+        }
+
+        $fullPath = $targetPath.DIRECTORY_SEPARATOR.str_replace('/', DIRECTORY_SEPARATOR, $normalized);
+        if (! file_exists($fullPath) && ! is_link($fullPath)) {
+            return 0;
+        }
+
+        return $this->deletePath($fullPath);
+    }
+
+    protected function normalizeRelativePath(string $relativePath): string
+    {
+        $normalized = trim(str_replace('\\', '/', $relativePath));
+        $normalized = ltrim($normalized, '/');
+        if ($normalized === '' || str_contains($normalized, '..')) {
+            throw new RuntimeException('Caminho relativo invalido recebido para operacao remota.');
+        }
+
+        return $normalized;
+    }
+
+    protected function deletePath(string $path): int
+    {
+        if (is_link($path) || is_file($path)) {
+            if (! @unlink($path)) {
+                throw new RuntimeException(sprintf('Nao foi possivel remover o arquivo [%s].', $path));
+            }
+            return 1;
+        }
+
+        if (! is_dir($path)) {
+            return 0;
+        }
+
+        $removed = 0;
+        $entries = array_diff(scandir($path) ?: [], ['.', '..']);
+        foreach ($entries as $entry) {
+            $removed += $this->deletePath($path.DIRECTORY_SEPARATOR.$entry);
+        }
+
+        if (! @rmdir($path)) {
+            throw new RuntimeException(sprintf('Nao foi possivel remover o diretorio [%s].', $path));
+        }
+
+        return $removed + 1;
+    }
+
+    protected function assertSafeArchiveEntry(string $entryName): void
+    {
+        $normalized = trim(str_replace('\\', '/', $entryName));
+        if ($normalized === '') {
+            throw new RuntimeException('O arquivo release.zip contem uma entrada vazia.');
+        }
+        if (str_starts_with($normalized, '/') || str_contains($normalized, '../') || str_contains($normalized, '..\\') || str_ends_with($normalized, '/..') || $normalized === '..') {
+            throw new RuntimeException(sprintf('Entrada insegura detectada no release.zip: [%s].', $entryName));
+        }
+    }
 }
 `
 
@@ -721,6 +942,8 @@ class DeployHookReceiverService
 
     public function handle(ReceiveDeployHookRequest $request): array
     {
+        $this->applyRequestTimeout();
+
         $signature = $request->attributes->get('deploy_hook_signature', []);
         $idempotencyKey = (string) ($signature['idempotency_key'] ?? '');
         $payloadHash = (string) ($signature['payload_hash'] ?? '');
@@ -748,7 +971,7 @@ class DeployHookReceiverService
             $execution = $this->createExecution($request, $signature);
 
             try {
-                $commandResults = $this->pipelineService->run();
+                $commandResults = $this->runOperation($request);
 
                 $execution->update([
                     'status' => DeployHookExecution::STATUS_SUCCESS,
@@ -776,7 +999,7 @@ class DeployHookReceiverService
 
                 return $this->error(
                     'deploy_hook_failed',
-                    'Falha ao executar o pipeline de pos-deploy.',
+                    'Falha ao executar a operacao remota do DeployPier.',
                     500,
                     [
                         'execution' => $this->executionPayload($execution),
@@ -787,6 +1010,25 @@ class DeployHookReceiverService
         } finally {
             $this->releaseLock($lock);
         }
+    }
+
+    protected function runOperation(ReceiveDeployHookRequest $request): array
+    {
+        $validated = $request->validated();
+
+        return match ((string) ($validated['operation'] ?? '')) {
+            'prepare_release_v1' => $this->pipelineService->prepareRelease(
+                releaseId: (string) $validated['release_id'],
+                baseReleaseId: isset($validated['base_release_id']) ? (string) $validated['base_release_id'] : null,
+                removePaths: is_array($validated['remove_paths'] ?? null) ? $validated['remove_paths'] : [],
+            ),
+            'extract_release_v1' => $this->pipelineService->extractRelease(
+                releaseId: (string) $validated['release_id'],
+                expectedArchiveSha256: isset($validated['artifact']['archive_sha256']) ? (string) $validated['artifact']['archive_sha256'] : null,
+                expectedArchiveSize: isset($validated['artifact']['archive_size']) ? (int) $validated['artifact']['archive_size'] : null,
+            ),
+            default => $this->pipelineService->run(),
+        };
     }
 
     protected function createExecution(ReceiveDeployHookRequest $request, array $signature): DeployHookExecution
@@ -921,6 +1163,14 @@ class DeployHookReceiverService
         }
     }
 
+    protected function applyRequestTimeout(): void
+    {
+        $seconds = max(30, (int) config('deploypier.request_timeout_seconds', 900));
+        if (function_exists('set_time_limit')) {
+            @set_time_limit($seconds);
+        }
+    }
+
     protected function error(string $code, string $message, int $status, array $details = []): array
     {
         return [
@@ -992,6 +1242,7 @@ const featureTestTemplate = `
 use App\Models\DeployHookExecution;
 use App\Services\Deploy\DeployHookSignatureService;
 use Illuminate\Support\Facades\Artisan;
+use ZipArchive;
 
 beforeEach(function () {
     config()->set('deploypier.enabled', true);
@@ -1000,6 +1251,7 @@ beforeEach(function () {
     config()->set('deploypier.signature_version', 'v1');
     config()->set('deploypier.signature_scope', 'deploy:post-deploy');
     config()->set('deploypier.replay_tolerance_seconds', 300);
+    config()->set('deploypier.request_timeout_seconds', 120);
     config()->set('deploypier.lock_seconds', 120);
     config()->set('deploypier.lock_key', 'deploypier:test-receiver');
     config()->set('deploypier.queue_restart', true);
@@ -1030,6 +1282,64 @@ test('deploy hook receiver processes a valid request', function () {
         'idempotency_key' => 'scaffold-success-1',
         'status' => DeployHookExecution::STATUS_SUCCESS,
     ]);
+});
+
+test('deploy hook receiver prepares a remote release clone', function () {
+    @mkdir(base_path('config'), 0755, true);
+    @mkdir(base_path('public'), 0755, true);
+    file_put_contents(base_path('config/app.php'), '<?php return [];');
+    file_put_contents(base_path('public/build-old.js'), 'old-build');
+
+    $payload = [
+        'operation' => 'prepare_release_v1',
+        'release_id' => '20260716T101500Z',
+        'base_release_id' => basename(base_path()),
+        'remove_paths' => ['public/build-old.js'],
+        'triggered_at' => now('UTC')->toIso8601String(),
+    ];
+
+    $response = $this->withHeaders(deployHookHeaders($payload, 'scaffold-prepare-1'))
+        ->postJson('/api/internal/deploy/receive', $payload);
+
+    $response->assertOk()
+        ->assertJsonPath('status', 'completed');
+
+    $targetRoot = dirname(base_path()).DIRECTORY_SEPARATOR.'20260716T101500Z';
+    expect(is_file($targetRoot.'/config/app.php'))->toBeTrue();
+    expect(file_exists($targetRoot.'/public/build-old.js'))->toBeFalse();
+});
+
+test('deploy hook receiver extracts release zip into target release', function () {
+    $releaseRoot = dirname(base_path()).DIRECTORY_SEPARATOR.'20260716T103000Z';
+    @mkdir($releaseRoot, 0755, true);
+
+    $archivePath = $releaseRoot.DIRECTORY_SEPARATOR.'release.zip';
+    $zip = new ZipArchive();
+    expect($zip->open($archivePath, ZipArchive::CREATE | ZipArchive::OVERWRITE))->toBeTrue();
+    $zip->addFromString('bootstrap/app.php', '<?php return [];');
+    $zip->addFromString('public/build/app.js', 'console.log("ok");');
+    $zip->close();
+
+    $payload = [
+        'operation' => 'extract_release_v1',
+        'release_id' => '20260716T103000Z',
+        'triggered_at' => now('UTC')->toIso8601String(),
+        'artifact' => [
+            'uploaded_path' => $releaseRoot,
+            'archive_sha256' => hash_file('sha256', $archivePath),
+            'archive_size' => filesize($archivePath),
+        ],
+    ];
+
+    $response = $this->withHeaders(deployHookHeaders($payload, 'scaffold-extract-1'))
+        ->postJson('/api/internal/deploy/receive', $payload);
+
+    $response->assertOk()
+        ->assertJsonPath('status', 'completed');
+
+    expect(is_file($releaseRoot.'/bootstrap/app.php'))->toBeTrue();
+    expect(is_file($releaseRoot.'/public/build/app.js'))->toBeTrue();
+    expect(file_exists($archivePath))->toBeFalse();
 });
 
 function deployHookHeaders(array $payload, string $idempotencyKey): array
@@ -1251,6 +1561,7 @@ build:
 release:
   directory: "./.deploypier/releases"
   retain: 5
+  upload_mode: "archive"
 
 transport:
   kind: "ftps"
@@ -1273,9 +1584,11 @@ runtime:
 
 post_deploy:
   mode: "manual"
+  remote_ops: "auto"
   hook_url_env: "DEPLOY_HOOK_URL"
   key_id_env: "DEPLOY_HOOK_KEY_ID"
   secret_env: "DEPLOY_HOOK_SECRET"
+  request_timeout_env: "DEPLOY_HOOK_TIMEOUT"
   smoke_url: ""
 
 state:
@@ -1302,6 +1615,7 @@ DEPLOY_RUNTIME_CURRENT_POINTER=/home/%s/.deploypier/current.txt
 DEPLOY_HOOK_URL=
 DEPLOY_HOOK_KEY_ID=
 DEPLOY_HOOK_SECRET=
+DEPLOY_HOOK_TIMEOUT=10m
 `, ftpUser, ftpUser, ftpUser)
 }
 
@@ -1372,7 +1686,9 @@ func renderLocawebDeployGuide(projectName string, ftpUser string) string {
 			"- O deploy assume que os arquivos publicos do Laravel ficam em public_html.\n"+
 			"- transport.path, remote.app_root, remote.public_root e activation.current_pointer sao paths de transporte usados pelo FTP/SFTP.\n"+
 			"- runtime.app_root e runtime.current_pointer sao paths absolutos usados pelo PHP dentro do public_html/index.php.\n"+
+			"- Com post_deploy.remote_ops=auto, releases posteriores podem ser preparadas via Laravel para enviar so o delta de arquivos alterados.\n"+
 			"- Se existir env.production ou .env.production na raiz local, o primeiro push usa esse arquivo apenas para semear o .env remoto quando a hospedagem ainda nao tiver um .env.\n"+
+			"- DEPLOY_HOOK_TIMEOUT controla o timeout HTTP da CLI para o receiver; SYSTEM_DEPLOY_RECEIVER_REQUEST_TIMEOUT_SECONDS controla o tempo maximo do request no Laravel.\n"+
 			"- Quando o path real da conta diferir do padrao /home/<ftp_user>, o inspect-remote ajuda a sugerir os paths de transporte. Os paths de runtime ainda podem precisar de confirmacao manual.\n"+
 			"- O hook HTTP serve para pos-deploy da app ja operacional; bootstrap inicial continua no shell.\n"+
 			"- O public_html/index.php deve ser estavel e ler a release ativa a partir de .deploypier/current.txt.\n"+

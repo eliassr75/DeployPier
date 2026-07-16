@@ -103,16 +103,26 @@ func (t *SFTPTransport) Inspect(ctx context.Context) (Inspection, error) {
 	}, nil
 }
 
-func (t *SFTPTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string) (UploadResult, error) {
+func (t *SFTPTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string, progress UploadProgressFunc) (UploadResult, error) {
 	if exists, err := t.Exists(ctx, remotePath); err != nil {
 		return UploadResult{}, err
-	} else if exists {
+	} else if exists && !release.AllowExistingRemote {
 		return UploadResult{}, status.Wrap(status.KindConflict, "upload sftp release", errors.New("release already exists remotely"))
+	} else if !exists {
+		if err := t.MkdirAll(ctx, remotePath); err != nil {
+			return UploadResult{}, err
+		}
 	}
-	if err := t.MkdirAll(ctx, remotePath); err != nil {
-		return UploadResult{}, err
+	if strings.TrimSpace(release.ArchivePath) != "" {
+		if err := uploadArchiveRelease(ctx, release, remotePath, t.writeRemoteFile, progress); err != nil {
+			return UploadResult{}, err
+		}
+		return UploadResult{
+			RemotePath:   remotePath,
+			ManifestPath: path.Join(cleanRemote(remotePath), "manifest.json"),
+		}, nil
 	}
-	if err := uploadReleaseTree(ctx, release, remotePath, t.writeRemoteFile); err != nil {
+	if err := uploadReleaseTree(ctx, release, remotePath, t.writeRemoteFile, progress); err != nil {
 		return UploadResult{}, err
 	}
 	return UploadResult{

@@ -23,6 +23,17 @@ type UploadResult struct {
 	ManifestPath string
 }
 
+type UploadProgress struct {
+	Path           string
+	UploadedFiles  int
+	TotalFiles     int
+	UploadedBytes  int64
+	TotalBytes     int64
+	ManifestUpload bool
+}
+
+type UploadProgressFunc func(UploadProgress)
+
 type FileInfo struct {
 	Path      string
 	Size      int64
@@ -40,7 +51,7 @@ type Transport interface {
 	Name() string
 	Probe(ctx context.Context) status.Report
 	Inspect(ctx context.Context) (Inspection, error)
-	UploadRelease(ctx context.Context, release build.Release, remotePath string) (UploadResult, error)
+	UploadRelease(ctx context.Context, release build.Release, remotePath string, progress UploadProgressFunc) (UploadResult, error)
 	ReadFile(ctx context.Context, remotePath string) ([]byte, error)
 	WriteFile(ctx context.Context, remotePath string, data []byte) error
 	Stat(ctx context.Context, remotePath string) (FileInfo, error)
@@ -118,16 +129,26 @@ func (t *LocalTransport) Inspect(_ context.Context) (Inspection, error) {
 	}, nil
 }
 
-func (t *LocalTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string) (UploadResult, error) {
+func (t *LocalTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string, progress UploadProgressFunc) (UploadResult, error) {
 	if exists, err := t.Exists(ctx, remotePath); err != nil {
 		return UploadResult{}, err
-	} else if exists {
+	} else if exists && !release.AllowExistingRemote {
 		return UploadResult{}, status.Wrap(status.KindConflict, "upload release", errors.New("release already exists remotely"))
+	} else if !exists {
+		if err := os.MkdirAll(remotePath, 0o755); err != nil {
+			return UploadResult{}, status.Wrap(status.KindInternal, "create remote release directory", err)
+		}
 	}
-	if err := os.MkdirAll(remotePath, 0o755); err != nil {
-		return UploadResult{}, status.Wrap(status.KindInternal, "create remote release directory", err)
+	if strings.TrimSpace(release.ArchivePath) != "" {
+		if err := uploadArchiveRelease(ctx, release, remotePath, t.writeLocalFile, progress); err != nil {
+			return UploadResult{}, err
+		}
+		return UploadResult{
+			RemotePath:   remotePath,
+			ManifestPath: filepath.Join(remotePath, "manifest.json"),
+		}, nil
 	}
-	if err := uploadReleaseTree(ctx, release, remotePath, t.writeLocalFile); err != nil {
+	if err := uploadReleaseTree(ctx, release, remotePath, t.writeLocalFile, progress); err != nil {
 		return UploadResult{}, err
 	}
 	return UploadResult{
@@ -284,34 +305,117 @@ func (t *LocalTransport) writeLocalFile(localPath string, remotePath string, mod
 
 type uploadWriter func(localPath string, remotePath string, mode fs.FileMode) error
 
-func uploadReleaseTree(ctx context.Context, release build.Release, remotePath string, writer uploadWriter) error {
-	if err := walkLocalTree(ctx, release.BundlePath, func(localPath string, relativePath string, info fs.FileInfo) error {
-		return writer(localPath, joinRemotePath(remotePath, relativePath), info.Mode())
-	}); err != nil {
-		return err
+func uploadReleaseTree(ctx context.Context, release build.Release, remotePath string, writer uploadWriter, progress UploadProgressFunc) error {
+	manifestInfo, err := os.Stat(release.ManifestPath)
+	if err != nil {
+		return status.Wrap(status.KindInternal, "stat release manifest", err)
 	}
-	return writer(release.ManifestPath, joinRemotePath(remotePath, "manifest.json"), 0o644)
-}
 
-func walkLocalTree(ctx context.Context, root string, visit func(localPath string, relativePath string, info fs.FileInfo) error) error {
-	return filepath.Walk(root, func(current string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return status.Wrap(status.KindInternal, "walk local tree", walkErr)
-		}
+	totalFiles := len(release.Manifest.Files) + 1
+	var totalBytes int64 = manifestInfo.Size()
+	for _, file := range release.Manifest.Files {
+		totalBytes += file.Size
+	}
+
+	uploadedFiles := 0
+	var uploadedBytes int64
+	for _, file := range release.Manifest.Files {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		if info.IsDir() {
-			return nil
+
+		localPath := filepath.Join(release.BundlePath, filepath.FromSlash(file.Path))
+		if err := writer(localPath, joinRemotePath(remotePath, file.Path), 0o644); err != nil {
+			return err
 		}
-		relativePath, err := filepath.Rel(root, current)
-		if err != nil {
-			return status.Wrap(status.KindInternal, "build relative path", err)
+		uploadedFiles++
+		uploadedBytes += file.Size
+		if progress != nil {
+			progress(UploadProgress{
+				Path:          file.Path,
+				UploadedFiles: uploadedFiles,
+				TotalFiles:    totalFiles,
+				UploadedBytes: uploadedBytes,
+				TotalBytes:    totalBytes,
+			})
 		}
-		return visit(current, filepath.ToSlash(relativePath), info)
-	})
+	}
+
+	if err := writer(release.ManifestPath, joinRemotePath(remotePath, "manifest.json"), 0o644); err != nil {
+		return err
+	}
+	if progress != nil {
+		progress(UploadProgress{
+			Path:           "manifest.json",
+			UploadedFiles:  totalFiles,
+			TotalFiles:     totalFiles,
+			UploadedBytes:  totalBytes,
+			TotalBytes:     totalBytes,
+			ManifestUpload: true,
+		})
+	}
+	return nil
+}
+
+func uploadArchiveRelease(ctx context.Context, release build.Release, remotePath string, writer uploadWriter, progress UploadProgressFunc) error {
+	archiveInfo, err := os.Stat(release.ArchivePath)
+	if err != nil {
+		return status.Wrap(status.KindInternal, "stat release archive", err)
+	}
+	manifestInfo, err := os.Stat(release.ManifestPath)
+	if err != nil {
+		return status.Wrap(status.KindInternal, "stat release manifest", err)
+	}
+
+	totalFiles := 2
+	totalBytes := archiveInfo.Size() + manifestInfo.Size()
+	uploadedFiles := 0
+	var uploadedBytes int64
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	if err := writer(release.ArchivePath, joinRemotePath(remotePath, "release.zip"), 0o644); err != nil {
+		return err
+	}
+	uploadedFiles++
+	uploadedBytes += archiveInfo.Size()
+	if progress != nil {
+		progress(UploadProgress{
+			Path:          "release.zip",
+			UploadedFiles: uploadedFiles,
+			TotalFiles:    totalFiles,
+			UploadedBytes: uploadedBytes,
+			TotalBytes:    totalBytes,
+		})
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	if err := writer(release.ManifestPath, joinRemotePath(remotePath, "manifest.json"), 0o644); err != nil {
+		return err
+	}
+	if progress != nil {
+		progress(UploadProgress{
+			Path:           "manifest.json",
+			UploadedFiles:  totalFiles,
+			TotalFiles:     totalFiles,
+			UploadedBytes:  totalBytes,
+			TotalBytes:     totalBytes,
+			ManifestUpload: true,
+		})
+	}
+
+	return nil
 }
 
 func joinRemotePath(root string, relativePath string) string {

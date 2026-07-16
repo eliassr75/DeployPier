@@ -14,6 +14,7 @@ O `DeployPier` não tenta transformar shared hosting em VPS. A ideia é trabalha
 - release versionada
 - manifesto com integridade
 - upload remoto via FTPS ou SFTP
+- upload remoto opcional por `release.zip`
 - ativação remota
 - rollback de código
 - hook Laravel assinado para pós-deploy
@@ -31,6 +32,8 @@ Já implementado:
 - lock remoto por diretório
 - validação remota do manifesto com hash por arquivo
 - ativação remota `release-based`
+- preparação remota de release via Laravel para upload delta
+- extração remota de `release.zip` via Laravel com `ZipArchive`
 - fallback explícito para `in-place` quando `remote.layout=auto` e o swap falha
 - scaffold do receiver Laravel
 - scaffold de bootstrap/documentação para Locaweb
@@ -40,18 +43,19 @@ Já implementado:
 
 Antes de usar a CLI, vale alinhar três termos:
 
-- `build`: é a etapa local que roda Composer e Node, monta a pasta da release e gera o `manifest.json`
+- `build`: é a etapa local que roda Composer e Node, monta a pasta da release, gera o `manifest.json` e pode gerar também o `release.zip`
 - `release`: é um pacote versionado do seu projeto, gerado automaticamente pela CLI com um `release_id` no formato de timestamp
 - `ativação`: é o momento em que a release enviada passa a ser a versão pública do site
 
-Na prática, `ativar` significa trocar o que está servindo em `public_html` para apontar para a release nova.
+Na prática, `ativar` significa atualizar o ponteiro de release atual e sincronizar o conteúdo público da release nova para `public_html`, preservando o `index.php` estável e o `storage`.
 
 Você não precisa informar `release` manualmente no fluxo normal. O comportamento padrão é:
 
-1. você roda `build`
-2. a CLI gera a release mais recente
-3. você roda `push`
-4. o `push` usa automaticamente a última release gerada
+1. você roda `push`
+2. a CLI gera a release local automaticamente
+3. a mesma execução já envia e ativa essa release
+
+Se você preferir inspecionar a release antes, ainda pode rodar `build` separadamente e depois publicar uma release específica com `push -release ...`.
 
 O parâmetro `-release` existe só para casos específicos, como:
 
@@ -105,7 +109,7 @@ O `inspect-remote` tenta descobrir o diretório remoto atual via FTPS/SFTP e sug
 
 Isso ajuda bastante em hospedagens como a Locaweb, onde o path do FTP pode ser chrootado e diferir do path absoluto que o PHP enxerga no servidor.
 
-### 4. Gerar a release local
+### 4. Gerar a release local se quiser inspecionar antes
 
 ```bash
 deploypier build -config ./deploy.yml
@@ -116,6 +120,9 @@ Esse comando:
 - roda o build local
 - gera uma pasta em `.deploypier/releases/<release_id>`
 - cria o `manifest.json`
+- quando `release.upload_mode=archive`, também gera o `release.zip`
+
+Esse passo é opcional no fluxo normal. Ele existe para quem quer revisar a release antes do upload ou reaproveitar um `release_id` específico depois.
 
 ### 5. Publicar
 
@@ -123,7 +130,7 @@ Esse comando:
 deploypier push -config ./deploy.yml
 ```
 
-Sem passar `-release`, a CLI usa automaticamente a última release gerada no passo anterior.
+Sem passar `-release`, a CLI gera a release automaticamente e já segue com o deploy. Se você informar `-release`, aí sim ela publica uma release local já existente.
 
 ### 6. Se precisar voltar
 
@@ -140,13 +147,17 @@ No modo padrão `release-based`, o fluxo é:
 1. build local com Composer e Node
 2. empacotamento por allowlist
 3. geração de `manifest.json`
-4. upload da release para `app/releases/<release_id>`
-5. seed inicial do `.env` remoto a partir de `env.production` ou `.env.production`, apenas quando a hospedagem ainda não tiver `.env`
-6. cópia do `.env` compartilhado para a release enviada
-7. verificação remota do manifesto
-8. sincronização dos assets públicos para `public_html`, preservando `index.php` e `storage`
-9. atualização do estado remoto e do ponteiro de release atual em `.deploypier/current.txt`
-10. hook Laravel assinado, quando `post_deploy.mode=auto` ou `post_deploy.mode=bypass`
+4. se `post_deploy.remote_ops=auto|required` e já existir uma release ativa com `manifest.json`, o receiver Laravel prepara a nova release no servidor clonando a release atual e removendo os arquivos órfãos previstos
+5. upload da release para `app/releases/<release_id>`
+6. em `release.upload_mode=files`, a CLI envia arquivos soltos
+7. em `release.upload_mode=archive`, a CLI envia `release.zip` + `manifest.json` e pede ao Laravel para extrair a release no host
+8. quando a etapa de preparo remoto aconteceu, o upload pode enviar só o delta alterado; quando isso não acontece, envia a release completa
+9. seed inicial do `.env` remoto a partir de `env.production` ou `.env.production`, apenas quando a hospedagem ainda não tiver `.env`
+10. cópia do `.env` compartilhado para a release enviada
+11. verificação remota do manifesto
+12. sincronização dos assets públicos para `public_html`, preservando `index.php` e `storage`
+13. atualização do estado remoto e do ponteiro de release atual em `.deploypier/current.txt`
+14. hook Laravel assinado, quando `post_deploy.mode=auto` ou `post_deploy.mode=bypass`
 
 No rollback, a CLI reativa a release anterior registrada no estado remoto e recompõe o `public_html` com os assets daquela release.
 
@@ -477,6 +488,7 @@ build:
 release:
   directory: "./.deploypier/releases"
   retain: 5
+  upload_mode: "archive"
 
 transport:
   kind: "ftps"
@@ -499,9 +511,11 @@ runtime:
 
 post_deploy:
   mode: "manual"
+  remote_ops: "auto"
   hook_url_env: "DEPLOY_HOOK_URL"
   key_id_env: "DEPLOY_HOOK_KEY_ID"
   secret_env: "DEPLOY_HOOK_SECRET"
+  request_timeout_env: "DEPLOY_HOOK_TIMEOUT"
   smoke_url: ""
 
 state:
@@ -531,6 +545,7 @@ DEPLOY_RUNTIME_CURRENT_POINTER=
 DEPLOY_HOOK_URL=
 DEPLOY_HOOK_KEY_ID=
 DEPLOY_HOOK_SECRET=
+DEPLOY_HOOK_TIMEOUT=10m
 ```
 
 Para SFTP, você também pode apontar o arquivo de `known_hosts` via:
@@ -561,12 +576,44 @@ Headers esperados:
 - `X-Deploy-Signature-Scope`
 - `X-Deploy-Signature`
 
-O pipeline de pós-deploy executado pelo receiver é:
+Esse endpoint aceita três operações assinadas:
+
+- `post_deploy_v1`
+- `prepare_release_v1`
+- `extract_release_v1`
+
+Em `post_deploy_v1`, o pipeline executado pelo receiver é:
 
 - `migrate --force`
 - `optimize:clear`
 - `optimize`
 - `queue:restart` quando aplicável
+
+Em `prepare_release_v1`, o receiver:
+
+- clona a release ativa atual para a nova release remota
+- remove arquivos órfãos que saíram do build novo
+- deixa o servidor pronto para receber só os arquivos alterados via FTP/SFTP
+
+Em `extract_release_v1`, o receiver:
+
+- resolve o diretório da release a partir do `release_id`
+- valida tamanho e SHA-256 do `release.zip`
+- extrai o pacote com `ZipArchive`
+- bloqueia entradas inseguras no zip
+- remove o `release.zip` temporário ao final
+
+Se a release puder ficar grande e você quiser aumentar a tolerância dessas rotas, ajuste no Laravel:
+
+```bash
+SYSTEM_DEPLOY_RECEIVER_REQUEST_TIMEOUT_SECONDS=900
+```
+
+e no lado da CLI:
+
+```bash
+DEPLOY_HOOK_TIMEOUT=10m
+```
 
 ## Política de migrations
 
@@ -575,6 +622,14 @@ O default público recomendado é:
 ```yaml
 post_deploy:
   mode: "manual"
+  remote_ops: "auto"
+```
+
+Para shared hosting, o modo mais resiliente costuma ser:
+
+```yaml
+release:
+  upload_mode: "archive"
 ```
 
 Quando `mode=auto`, a CLI só aceita migrations bem aditivas e curtas. Se o diff não puder ser avaliado, ou se aparecer qualquer migration fora da allowlist, o caminho automático é bloqueado antes da promoção.
@@ -594,6 +649,8 @@ O bootstrap gerado cobre tarefas que normalmente acabam sendo feitas manualmente
 - recriar o symlink `public_html/storage`
 
 No modo `release-based`, o `public_html/index.php` deve ficar estável e ler a release ativa usando `.deploypier/current.txt`. Nesse arquivo, use os paths de `runtime`, não os paths de transporte. Se o arquivo remoto ainda não existir, o `doctor` gera esse bootstrap automaticamente. Se ele já existir e estiver customizado, o DeployPier não o sobrescreve.
+
+Na prática, em hospedagens como a Locaweb, `upload_mode=archive` tende a reduzir bastante as falhas de envio porque troca muitos uploads pequenos por um único pacote.
 
 ## Segurança
 

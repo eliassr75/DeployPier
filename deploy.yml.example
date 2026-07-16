@@ -26,6 +26,7 @@ build:
 release:
   directory: "./.deploypier/releases"
   retain: 5
+  upload_mode: "archive"
 
 transport:
   kind: "ftps"
@@ -48,9 +49,11 @@ runtime:
 
 post_deploy:
   mode: "manual"
+  remote_ops: "auto"
   hook_url_env: "DEPLOY_HOOK_URL"
   key_id_env: "DEPLOY_HOOK_KEY_ID"
   secret_env: "DEPLOY_HOOK_SECRET"
+  request_timeout_env: "DEPLOY_HOOK_TIMEOUT"
 
 state:
   file: "./.deploypier/state.json"

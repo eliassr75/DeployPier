@@ -1,10 +1,13 @@
 package app
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -45,9 +48,10 @@ func (f *fakeBuilder) Load(ctx context.Context, cfg config.Config, releaseID str
 }
 
 type fakeTransport struct {
-	uploaded []string
-	files    map[string][]byte
-	inspect  transport.Inspection
+	uploaded  []string
+	files     map[string][]byte
+	inspect   transport.Inspection
+	removeErr error
 }
 
 func (f *fakeTransport) Name() string {
@@ -64,24 +68,110 @@ func (f *fakeTransport) Inspect(ctx context.Context) (transport.Inspection, erro
 	return f.inspect, nil
 }
 
-func (f *fakeTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string) (transport.UploadResult, error) {
+func (f *fakeTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string, progress transport.UploadProgressFunc) (transport.UploadResult, error) {
 	_ = ctx
 	if f.files == nil {
 		f.files = map[string][]byte{}
 	}
 	f.uploaded = append(f.uploaded, release.ID)
+	if strings.TrimSpace(release.ArchivePath) != "" {
+		return f.uploadArchiveRelease(release, remotePath, progress)
+	}
+	totalFiles := len(release.Manifest.Files) + 1
+	uploadedFiles := 0
+	var uploadedBytes int64
+	var totalBytes int64
+	for _, file := range release.Manifest.Files {
+		totalBytes += file.Size
+	}
 	for _, file := range release.Manifest.Files {
 		content, err := os.ReadFile(filepath.Join(release.BundlePath, filepath.FromSlash(file.Path)))
 		if err != nil {
 			return transport.UploadResult{}, err
 		}
 		f.files[path.Join(remotePath, file.Path)] = content
+		uploadedFiles++
+		uploadedBytes += file.Size
+		if progress != nil {
+			progress(transport.UploadProgress{
+				Path:          file.Path,
+				UploadedFiles: uploadedFiles,
+				TotalFiles:    totalFiles,
+				UploadedBytes: uploadedBytes,
+				TotalBytes:    totalBytes,
+			})
+		}
 	}
-	rawManifest, err := json.Marshal(release.Manifest)
+	var (
+		rawManifest []byte
+		err         error
+	)
+	if strings.TrimSpace(release.ManifestPath) != "" {
+		rawManifest, err = os.ReadFile(release.ManifestPath)
+		if err != nil {
+			return transport.UploadResult{}, err
+		}
+	} else {
+		rawManifest, err = json.Marshal(release.Manifest)
+		if err != nil {
+			return transport.UploadResult{}, err
+		}
+	}
+	f.files[path.Join(remotePath, "manifest.json")] = rawManifest
+	if progress != nil {
+		progress(transport.UploadProgress{
+			Path:           "manifest.json",
+			UploadedFiles:  totalFiles,
+			TotalFiles:     totalFiles,
+			UploadedBytes:  totalBytes,
+			TotalBytes:     totalBytes,
+			ManifestUpload: true,
+		})
+	}
+	return transport.UploadResult{RemotePath: remotePath, ManifestPath: path.Join(remotePath, "manifest.json")}, nil
+}
+
+func (f *fakeTransport) uploadArchiveRelease(release build.Release, remotePath string, progress transport.UploadProgressFunc) (transport.UploadResult, error) {
+	rawArchive, err := os.ReadFile(release.ArchivePath)
 	if err != nil {
 		return transport.UploadResult{}, err
 	}
+	var (
+		rawManifest []byte
+	)
+	if strings.TrimSpace(release.ManifestPath) != "" {
+		rawManifest, err = os.ReadFile(release.ManifestPath)
+		if err != nil {
+			return transport.UploadResult{}, err
+		}
+	} else {
+		rawManifest, err = json.Marshal(release.Manifest)
+		if err != nil {
+			return transport.UploadResult{}, err
+		}
+	}
+	totalBytes := int64(len(rawArchive) + len(rawManifest))
+	f.files[path.Join(remotePath, "release.zip")] = rawArchive
+	if progress != nil {
+		progress(transport.UploadProgress{
+			Path:          "release.zip",
+			UploadedFiles: 1,
+			TotalFiles:    2,
+			UploadedBytes: int64(len(rawArchive)),
+			TotalBytes:    totalBytes,
+		})
+	}
 	f.files[path.Join(remotePath, "manifest.json")] = rawManifest
+	if progress != nil {
+		progress(transport.UploadProgress{
+			Path:           "manifest.json",
+			UploadedFiles:  2,
+			TotalFiles:     2,
+			UploadedBytes:  totalBytes,
+			TotalBytes:     totalBytes,
+			ManifestUpload: true,
+		})
+	}
 	return transport.UploadResult{RemotePath: remotePath, ManifestPath: path.Join(remotePath, "manifest.json")}, nil
 }
 
@@ -141,7 +231,18 @@ func (f *fakeTransport) Rename(ctx context.Context, fromPath string, toPath stri
 
 func (f *fakeTransport) Mkdir(ctx context.Context, remotePath string) error {
 	_ = ctx
-	_ = remotePath
+	if f.files == nil {
+		f.files = map[string][]byte{}
+	}
+	prefix := remotePath
+	if !strings.HasSuffix(prefix, "/") && !strings.HasSuffix(prefix, `\`) {
+		prefix += "/"
+	}
+	for existingPath := range f.files {
+		if strings.HasPrefix(existingPath, prefix) {
+			return os.ErrExist
+		}
+	}
 	return nil
 }
 
@@ -153,7 +254,19 @@ func (f *fakeTransport) MkdirAll(ctx context.Context, remotePath string) error {
 
 func (f *fakeTransport) RemoveAll(ctx context.Context, remotePath string) error {
 	_ = ctx
+	if f.removeErr != nil {
+		return f.removeErr
+	}
 	delete(f.files, remotePath)
+	prefix := remotePath
+	if !strings.HasSuffix(prefix, "/") && !strings.HasSuffix(prefix, `\`) {
+		prefix += "/"
+	}
+	for existingPath := range f.files {
+		if strings.HasPrefix(existingPath, prefix) {
+			delete(f.files, existingPath)
+		}
+	}
 	return nil
 }
 
@@ -275,19 +388,12 @@ func TestBuildRecordsReleaseAndRunsHooks(t *testing.T) {
 	}
 }
 
-func TestPushUsesLatestBuildWhenReleaseIsOmitted(t *testing.T) {
+func TestPushBuildsReleaseWhenReleaseIsOmitted(t *testing.T) {
 	tempDir := t.TempDir()
 	store := state.New(filepath.Join(tempDir, "state.json"))
-	if err := store.RecordBuild(context.Background(), state.BuildRecord{
-		ReleaseID: "rel-2",
-		Path:      filepath.Join(tempDir, "releases", "rel-2"),
-		BuiltAt:   "2026-07-14T12:00:00Z",
-	}); err != nil {
-		t.Fatalf("record build: %v", err)
-	}
 
 	builder := &fakeBuilder{
-		loadRelease: build.Release{
+		buildRelease: build.Release{
 			ID:   "rel-2",
 			Path: filepath.Join(tempDir, "releases", "rel-2"),
 		},
@@ -298,6 +404,8 @@ func TestPushUsesLatestBuildWhenReleaseIsOmitted(t *testing.T) {
 	service := &Service{
 		cfg: config.Config{
 			Hooks: config.HooksConfig{
+				BeforeBuild:    []config.HookSpec{{Name: "before-build"}},
+				AfterBuild:     []config.HookSpec{{Name: "after-build"}},
 				BeforePush:     []config.HookSpec{{Name: "before-push"}},
 				AfterPush:      []config.HookSpec{{Name: "after-push"}},
 				BeforeActivate: []config.HookSpec{{Name: "before-activate"}},
@@ -329,6 +437,89 @@ func TestPushUsesLatestBuildWhenReleaseIsOmitted(t *testing.T) {
 	}
 	if len(activator.activated) != 1 || activator.activated[0] != "rel-2" {
 		t.Fatalf("unexpected activated releases: %#v", activator.activated)
+	}
+	if len(hooksRunner.phases) < 2 || hooksRunner.phases[0] != "before_build" || hooksRunner.phases[1] != "after_build" {
+		t.Fatalf("expected build hooks before push hooks, got %#v", hooksRunner.phases)
+	}
+
+	snapshot, err := store.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(snapshot.Builds) != 1 || snapshot.Builds[0].ReleaseID != "rel-2" {
+		t.Fatalf("expected push to record built release, got %#v", snapshot.Builds)
+	}
+}
+
+func TestAcquireRemoteLockReclaimsStaleLock(t *testing.T) {
+	transportImpl := &fakeTransport{
+		files: map[string][]byte{
+			"/remote/app/.deploypier/locks/deploy.lock/owner.txt": []byte("release_id=old-rel\ncreated_at=2026-07-15T09:00:00Z\n"),
+		},
+	}
+	service := &Service{
+		cfg: config.Config{
+			Remote: config.RemoteConfig{
+				AppRoot: "/remote/app",
+			},
+		},
+		transport: transportImpl,
+		now:       func() time.Time { return time.Date(2026, 7, 15, 10, 5, 0, 0, time.UTC) },
+	}
+
+	unlock, err := service.acquireRemoteLock(context.Background(), "new-rel")
+	if err != nil {
+		t.Fatalf("acquire remote lock: %v", err)
+	}
+	defer unlock()
+
+	raw, ok := transportImpl.files["/remote/app/.deploypier/locks/deploy.lock/owner.txt"]
+	if !ok {
+		t.Fatalf("expected renewed owner.txt after stale lock recovery")
+	}
+	content := string(raw)
+	if !strings.Contains(content, "release_id=new-rel") {
+		t.Fatalf("expected new release id in lock owner: %s", content)
+	}
+}
+
+func TestAcquireRemoteLockKeepsFreshLockProtected(t *testing.T) {
+	transportImpl := &fakeTransport{
+		files: map[string][]byte{
+			"/remote/app/.deploypier/locks/deploy.lock/owner.txt": []byte("release_id=active-rel\ncreated_at=2026-07-15T10:00:00Z\n"),
+		},
+	}
+	service := &Service{
+		cfg: config.Config{
+			Remote: config.RemoteConfig{
+				AppRoot: "/remote/app",
+			},
+		},
+		transport: transportImpl,
+		now:       func() time.Time { return time.Date(2026, 7, 15, 10, 5, 0, 0, time.UTC) },
+	}
+
+	if _, err := service.acquireRemoteLock(context.Background(), "new-rel"); err == nil {
+		t.Fatalf("expected fresh lock to block deploy")
+	}
+}
+
+func TestRecoverRemoteLockIgnoresMissingRemovalWhenLockAlreadyGone(t *testing.T) {
+	transportImpl := &fakeTransport{
+		removeErr: status.Wrap(status.KindInternal, "remove ftps dir", os.ErrNotExist),
+	}
+	service := &Service{
+		cfg: config.Config{
+			Remote: config.RemoteConfig{
+				AppRoot: "/remote/app",
+			},
+		},
+		transport: transportImpl,
+		now:       func() time.Time { return time.Date(2026, 7, 15, 10, 5, 0, 0, time.UTC) },
+	}
+
+	if err := service.recoverRemoteLock(context.Background(), "/remote/app/.deploypier/locks/deploy.lock"); err != nil {
+		t.Fatalf("expected missing removal to be ignored: %v", err)
 	}
 }
 
@@ -503,6 +694,294 @@ return new class {
 	}
 	if len(result.Warnings) == 0 || !strings.Contains(strings.Join(result.Warnings, "\n"), "bypass") {
 		t.Fatalf("expected bypass warning, got %#v", result.Warnings)
+	}
+}
+
+func TestPushUsesRemoteOpsToPrepareDeltaRelease(t *testing.T) {
+	tempDir := t.TempDir()
+	store := state.New(filepath.Join(tempDir, "state.json"))
+	projectRoot := filepath.Join(tempDir, "project")
+	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+
+	releasePath := filepath.Join(tempDir, "releases", "rel-new-1")
+	bundlePath := filepath.Join(releasePath, "bundle")
+	if err := os.MkdirAll(filepath.Join(bundlePath, "app"), 0o755); err != nil {
+		t.Fatalf("mkdir bundle app: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(bundlePath, "public", "build"), 0o755); err != nil {
+		t.Fatalf("mkdir bundle public: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundlePath, "app", "Foo.php"), []byte("<?php echo 'same';"), 0o644); err != nil {
+		t.Fatalf("write Foo.php: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundlePath, "public", "build", "app.js"), []byte("console.log('new build');"), 0o644); err != nil {
+		t.Fatalf("write app.js: %v", err)
+	}
+
+	sameContent := []byte("<?php echo 'same';")
+	oldBuild := []byte("console.log('old build');")
+	newBuild := []byte("console.log('new build');")
+	oldAsset := []byte("legacy")
+
+	release := build.Release{
+		ID:           "rel-new-1",
+		Path:         releasePath,
+		BundlePath:   bundlePath,
+		ManifestPath: filepath.Join(releasePath, "manifest.json"),
+		Manifest: build.Manifest{
+			ReleaseID: "rel-new-1",
+			SHA256:    "aggregate-new",
+			Files: []build.ManifestFile{
+				{Path: "app/Foo.php", Size: int64(len(sameContent)), SHA256: fileSHA256Hex(t, sameContent)},
+				{Path: "public/build/app.js", Size: int64(len(newBuild)), SHA256: fileSHA256Hex(t, newBuild)},
+			},
+		},
+	}
+	rawManifest, err := json.Marshal(release.Manifest)
+	if err != nil {
+		t.Fatalf("marshal release manifest: %v", err)
+	}
+	if err := os.MkdirAll(release.Path, 0o755); err != nil {
+		t.Fatalf("mkdir release path: %v", err)
+	}
+	if err := os.WriteFile(release.ManifestPath, rawManifest, 0o644); err != nil {
+		t.Fatalf("write release manifest: %v", err)
+	}
+	if err := store.RecordBuild(context.Background(), state.BuildRecord{
+		ReleaseID: release.ID,
+		Path:      release.Path,
+		BuiltAt:   "2026-07-16T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("record build: %v", err)
+	}
+
+	currentManifest := build.Manifest{
+		ReleaseID: "rel-old-1",
+		SHA256:    "aggregate-old",
+		Files: []build.ManifestFile{
+			{Path: "app/Foo.php", Size: int64(len(sameContent)), SHA256: fileSHA256Hex(t, sameContent)},
+			{Path: "public/build/app.js", Size: int64(len(oldBuild)), SHA256: fileSHA256Hex(t, oldBuild)},
+			{Path: "public/build/old.js", Size: int64(len(oldAsset)), SHA256: fileSHA256Hex(t, oldAsset)},
+		},
+	}
+	currentManifestRaw, err := json.Marshal(currentManifest)
+	if err != nil {
+		t.Fatalf("marshal current manifest: %v", err)
+	}
+
+	transportImpl := &fakeTransport{
+		files: map[string][]byte{
+			"/app/releases/rel-old-1/manifest.json":       currentManifestRaw,
+			"/app/releases/rel-old-1/app/Foo.php":         sameContent,
+			"/app/releases/rel-old-1/public/build/app.js": oldBuild,
+			"/app/releases/rel-old-1/public/build/old.js": oldAsset,
+		},
+	}
+
+	prepareRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload postdeploy.Payload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if payload.Operation != postdeploy.OperationPrepareRelease {
+			t.Fatalf("unexpected operation: %s", payload.Operation)
+		}
+		prepareRequests++
+
+		sourcePrefix := "/app/releases/rel-old-1/"
+		targetPrefix := "/app/releases/rel-new-1/"
+		for path, content := range transportImpl.files {
+			if strings.HasPrefix(path, sourcePrefix) {
+				targetPath := targetPrefix + strings.TrimPrefix(path, sourcePrefix)
+				transportImpl.files[targetPath] = append([]byte{}, content...)
+			}
+		}
+		for _, removed := range payload.RemovePaths {
+			delete(transportImpl.files, targetPrefix+removed)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true,"status":"completed"}`))
+	}))
+	defer server.Close()
+
+	service := &Service{
+		cfg: config.Config{
+			Project: config.ProjectConfig{Root: projectRoot, Name: "demo"},
+			Transport: config.TransportConfig{
+				Path: "/",
+			},
+			Remote: config.RemoteConfig{
+				AppRoot: "/app",
+				Layout:  "release-based",
+			},
+			PostDeploy: config.PostDeployConfig{
+				Mode:      "skip",
+				RemoteOps: "auto",
+				HookURL:   server.URL,
+				KeyID:     "test-key",
+				Secret:    "test-secret",
+			},
+		},
+		builder:    &fakeBuilder{loadRelease: release},
+		store:      store,
+		transport:  transportImpl,
+		activator:  &fakeActivator{current: "rel-old-1"},
+		hooks:      &fakeHooks{},
+		postDeploy: postdeploy.NewClient(),
+		now:        func() time.Time { return time.Date(2026, 7, 16, 10, 5, 0, 0, time.UTC) },
+	}
+
+	result, err := service.Push(context.Background(), release.ID, true)
+	if err != nil {
+		t.Fatalf("push with remote ops: %v", err)
+	}
+
+	if prepareRequests != 1 {
+		t.Fatalf("expected one prepare request, got %d", prepareRequests)
+	}
+	if len(transportImpl.uploaded) != 1 || transportImpl.uploaded[0] != "rel-new-1" {
+		t.Fatalf("unexpected uploaded releases: %#v", transportImpl.uploaded)
+	}
+	if string(transportImpl.files["/app/releases/rel-new-1/app/Foo.php"]) != string(sameContent) {
+		t.Fatalf("expected unchanged file to come from remote clone")
+	}
+	if string(transportImpl.files["/app/releases/rel-new-1/public/build/app.js"]) != string(newBuild) {
+		t.Fatalf("expected changed file to be uploaded")
+	}
+	if _, ok := transportImpl.files["/app/releases/rel-new-1/public/build/old.js"]; ok {
+		t.Fatalf("expected removed file to be pruned from prepared release")
+	}
+	if !strings.Contains(strings.Join(result.Warnings, "\n"), "remote ops prepared") {
+		t.Fatalf("expected remote ops warning/summary, got %#v", result.Warnings)
+	}
+}
+
+func TestPushArchiveModeUploadsZipAndExtractsRemotely(t *testing.T) {
+	tempDir := t.TempDir()
+	store := state.New(filepath.Join(tempDir, "state.json"))
+	projectRoot := filepath.Join(tempDir, "project")
+	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+
+	releasePath := filepath.Join(tempDir, "releases", "rel-archive-1")
+	bundlePath := filepath.Join(releasePath, "bundle")
+	if err := os.MkdirAll(filepath.Join(bundlePath, "bootstrap"), 0o755); err != nil {
+		t.Fatalf("mkdir bundle bootstrap: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(bundlePath, "public", "build"), 0o755); err != nil {
+		t.Fatalf("mkdir bundle public: %v", err)
+	}
+	bootstrapContent := []byte("<?php return [];")
+	jsContent := []byte("console.log('archive');")
+	if err := os.WriteFile(filepath.Join(bundlePath, "bootstrap", "app.php"), bootstrapContent, 0o644); err != nil {
+		t.Fatalf("write bootstrap/app.php: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundlePath, "public", "build", "app.js"), jsContent, 0o644); err != nil {
+		t.Fatalf("write public/build/app.js: %v", err)
+	}
+
+	release := build.Release{
+		ID:           "rel-archive-1",
+		Path:         releasePath,
+		BundlePath:   bundlePath,
+		ManifestPath: filepath.Join(releasePath, "manifest.json"),
+		Manifest: build.Manifest{
+			ReleaseID: "rel-archive-1",
+			SHA256:    "archive-aggregate",
+			Files: []build.ManifestFile{
+				{Path: "bootstrap/app.php", Size: int64(len(bootstrapContent)), SHA256: fileSHA256Hex(t, bootstrapContent)},
+				{Path: "public/build/app.js", Size: int64(len(jsContent)), SHA256: fileSHA256Hex(t, jsContent)},
+			},
+		},
+	}
+	if err := os.MkdirAll(release.Path, 0o755); err != nil {
+		t.Fatalf("mkdir release path: %v", err)
+	}
+	rawManifest, err := json.Marshal(release.Manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if err := os.WriteFile(release.ManifestPath, rawManifest, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := store.RecordBuild(context.Background(), state.BuildRecord{
+		ReleaseID: release.ID,
+		Path:      release.Path,
+		BuiltAt:   "2026-07-16T11:00:00Z",
+	}); err != nil {
+		t.Fatalf("record build: %v", err)
+	}
+
+	transportImpl := &fakeTransport{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload postdeploy.Payload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if payload.Operation != postdeploy.OperationExtractRelease {
+			t.Fatalf("unexpected operation: %s", payload.Operation)
+		}
+
+		archive := transportImpl.files["/app/releases/rel-archive-1/release.zip"]
+		extractArchiveIntoFiles(t, archive, "/app/releases/rel-archive-1", transportImpl.files)
+		delete(transportImpl.files, "/app/releases/rel-archive-1/release.zip")
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true,"status":"completed"}`))
+	}))
+	defer server.Close()
+
+	service := &Service{
+		cfg: config.Config{
+			Project: config.ProjectConfig{Root: projectRoot, Name: "demo"},
+			Release: config.ReleaseConfig{
+				UploadMode: "archive",
+			},
+			Transport: config.TransportConfig{
+				Path: "/",
+			},
+			Remote: config.RemoteConfig{
+				AppRoot: "/app",
+				Layout:  "release-based",
+			},
+			PostDeploy: config.PostDeployConfig{
+				Mode:      "skip",
+				RemoteOps: "off",
+				HookURL:   server.URL,
+				KeyID:     "test-key",
+				Secret:    "test-secret",
+			},
+		},
+		builder:    &fakeBuilder{loadRelease: release},
+		store:      store,
+		transport:  transportImpl,
+		activator:  &fakeActivator{},
+		hooks:      &fakeHooks{},
+		postDeploy: postdeploy.NewClient(),
+		now:        func() time.Time { return time.Date(2026, 7, 16, 11, 5, 0, 0, time.UTC) },
+	}
+
+	result, err := service.Push(context.Background(), release.ID, true)
+	if err != nil {
+		t.Fatalf("push archive service: %v", err)
+	}
+
+	if result.RemotePath != "/app/releases/rel-archive-1" {
+		t.Fatalf("unexpected remote path: %s", result.RemotePath)
+	}
+	if _, ok := transportImpl.files["/app/releases/rel-archive-1/release.zip"]; ok {
+		t.Fatalf("expected archive to be removed after extraction")
+	}
+	if string(transportImpl.files["/app/releases/rel-archive-1/bootstrap/app.php"]) != string(bootstrapContent) {
+		t.Fatalf("expected extracted bootstrap/app.php")
+	}
+	if string(transportImpl.files["/app/releases/rel-archive-1/public/build/app.js"]) != string(jsContent) {
+		t.Fatalf("expected extracted public/build/app.js")
 	}
 }
 
@@ -774,6 +1253,34 @@ func findDoctorCheck(t *testing.T, checks []DoctorCheck, name string) DoctorChec
 	}
 	t.Fatalf("doctor check not found: %s", name)
 	return DoctorCheck{}
+}
+
+func fileSHA256Hex(t *testing.T, data []byte) string {
+	t.Helper()
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func extractArchiveIntoFiles(t *testing.T, archive []byte, targetPrefix string, files map[string][]byte) {
+	t.Helper()
+
+	reader, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatalf("open test archive: %v", err)
+	}
+
+	for _, entry := range reader.File {
+		handle, err := entry.Open()
+		if err != nil {
+			t.Fatalf("open archive entry: %v", err)
+		}
+		content, err := io.ReadAll(handle)
+		_ = handle.Close()
+		if err != nil {
+			t.Fatalf("read archive entry: %v", err)
+		}
+		files[path.Join(targetPrefix, filepath.ToSlash(entry.Name))] = content
+	}
 }
 
 func writeGitStub(t *testing.T, dir string, stdout string) {

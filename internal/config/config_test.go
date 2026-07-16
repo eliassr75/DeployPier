@@ -39,6 +39,9 @@ transport:
 	if cfg.Release.Retain != 9 {
 		t.Fatalf("unexpected retain value: %d", cfg.Release.Retain)
 	}
+	if cfg.Release.UploadMode != "files" {
+		t.Fatalf("unexpected default upload mode: %s", cfg.Release.UploadMode)
+	}
 	if len(cfg.Build.Exclude) != 2 {
 		t.Fatalf("unexpected exclude count: %d", len(cfg.Build.Exclude))
 	}
@@ -77,14 +80,16 @@ remote:
 	}
 
 	cfg, err := Load(configPath, map[string]string{
-		"DEPLOY_HOST":                    "ftp.example.com",
-		"DEPLOY_PORT":                    "2121",
-		"DEPLOY_USER":                    "deploy-user",
-		"DEPLOY_REMOTE_APP_ROOT":         "/home/example/app",
-		"DEPLOY_REMOTE_PUBLIC_ROOT":      "/home/example/public_html",
-		"DEPLOY_RUNTIME_APP_ROOT":        "/srv/runtime/app",
-		"DEPLOY_RUNTIME_CURRENT_POINTER": "/srv/runtime/.deploypier/current.txt",
-		"DEPLOY_PASSWORD":                "secret",
+		"DEPLOY_HOST":                     "ftp.example.com",
+		"DEPLOY_PORT":                     "2121",
+		"DEPLOY_USER":                     "deploy-user",
+		"DEPLOY_REMOTE_APP_ROOT":          "/home/example/app",
+		"DEPLOY_REMOTE_PUBLIC_ROOT":       "/home/example/public_html",
+		"DEPLOY_RUNTIME_APP_ROOT":         "/srv/runtime/app",
+		"DEPLOY_RUNTIME_CURRENT_POINTER":  "/srv/runtime/.deploypier/current.txt",
+		"DEPLOY_HOOK_TIMEOUT":             "12m",
+		"DEPLOY_PASSWORD":                 "secret",
+		EnvPrefix + "RELEASE_UPLOAD_MODE": "archive",
 	}, tempDir)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
@@ -114,6 +119,12 @@ remote:
 	if cfg.Runtime.CurrentPointer != "/srv/runtime/.deploypier/current.txt" {
 		t.Fatalf("unexpected runtime pointer: %s", cfg.Runtime.CurrentPointer)
 	}
+	if cfg.PostDeploy.RequestTimeout != "12m" {
+		t.Fatalf("unexpected request timeout: %s", cfg.PostDeploy.RequestTimeout)
+	}
+	if cfg.Release.UploadMode != "archive" {
+		t.Fatalf("unexpected upload mode: %s", cfg.Release.UploadMode)
+	}
 }
 
 func TestValidateRejectsMissingHookCommand(t *testing.T) {
@@ -132,5 +143,25 @@ func TestValidateAcceptsBypassPostDeployMode(t *testing.T) {
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected bypass mode to be accepted: %v", err)
+	}
+}
+
+func TestValidateRejectsUnknownRemoteOpsMode(t *testing.T) {
+	cfg := defaults(t.TempDir())
+	cfg.PostDeploy.RemoteOps = "maybe"
+	normalizeRuntime(&cfg)
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error for remote ops mode")
+	}
+}
+
+func TestValidateRejectsUnknownUploadMode(t *testing.T) {
+	cfg := defaults(t.TempDir())
+	cfg.Release.UploadMode = "tarball"
+	normalizeRuntime(&cfg)
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatalf("expected validation error for upload mode")
 	}
 }

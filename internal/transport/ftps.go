@@ -75,13 +75,13 @@ func (t *FTPSTransport) Probe(ctx context.Context) status.Report {
 		return status.Report{
 			Level:   status.LevelWarn,
 			Code:    "insecure_ftps",
-			Message: "ftps is connected with certificate verification disabled",
+			Message: fmt.Sprintf("%s is connected with certificate verification disabled", t.logProtocolName()),
 		}
 	}
 	return status.Report{
 		Level:   status.LevelOK,
 		Code:    "ok",
-		Message: "ftps transport ready",
+		Message: fmt.Sprintf("%s transport ready", t.logProtocolName()),
 	}
 }
 
@@ -96,7 +96,7 @@ func (t *FTPSTransport) Inspect(ctx context.Context) (Inspection, error) {
 
 	currentDir, err := conn.CurrentDir()
 	if err != nil {
-		return Inspection{}, status.Wrap(status.KindInternal, "inspect ftps current dir", err)
+		return Inspection{}, status.Wrap(status.KindInternal, "inspect "+t.logProtocolName()+" current dir", err)
 	}
 
 	return Inspection{
@@ -105,16 +105,26 @@ func (t *FTPSTransport) Inspect(ctx context.Context) (Inspection, error) {
 	}, nil
 }
 
-func (t *FTPSTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string) (UploadResult, error) {
+func (t *FTPSTransport) UploadRelease(ctx context.Context, release build.Release, remotePath string, progress UploadProgressFunc) (UploadResult, error) {
 	if exists, err := t.Exists(ctx, remotePath); err != nil {
 		return UploadResult{}, err
-	} else if exists {
-		return UploadResult{}, status.Wrap(status.KindConflict, "upload ftps release", errors.New("release already exists remotely"))
+	} else if exists && !release.AllowExistingRemote {
+		return UploadResult{}, status.Wrap(status.KindConflict, "upload "+t.logProtocolName()+" release", errors.New("release already exists remotely"))
+	} else if !exists {
+		if err := t.MkdirAll(ctx, remotePath); err != nil {
+			return UploadResult{}, err
+		}
 	}
-	if err := t.MkdirAll(ctx, remotePath); err != nil {
-		return UploadResult{}, err
+	if strings.TrimSpace(release.ArchivePath) != "" {
+		if err := uploadArchiveRelease(ctx, release, remotePath, t.writeRemoteFile, progress); err != nil {
+			return UploadResult{}, err
+		}
+		return UploadResult{
+			RemotePath:   remotePath,
+			ManifestPath: path.Join(remotePath, "manifest.json"),
+		}, nil
 	}
-	if err := uploadReleaseTree(ctx, release, remotePath, t.writeRemoteFile); err != nil {
+	if err := uploadReleaseTree(ctx, release, remotePath, t.writeRemoteFile, progress); err != nil {
 		return UploadResult{}, err
 	}
 	return UploadResult{
@@ -133,13 +143,13 @@ func (t *FTPSTransport) ReadFile(ctx context.Context, remotePath string) ([]byte
 	}
 	reader, err := conn.Retr(cleanRemote(remotePath))
 	if err != nil {
-		return nil, status.Wrap(status.KindNotFound, "retrieve ftps file", err)
+		return nil, status.Wrap(status.KindNotFound, "retrieve "+t.logProtocolName()+" file", err)
 	}
 	defer reader.Close()
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		return nil, status.Wrap(status.KindInternal, "read ftps file", err)
+		return nil, status.Wrap(status.KindInternal, "read "+t.logProtocolName()+" file", err)
 	}
 	return data, nil
 }
@@ -158,7 +168,7 @@ func (t *FTPSTransport) Stat(ctx context.Context, remotePath string) (FileInfo, 
 	}
 	entry, err := conn.GetEntry(cleanRemote(remotePath))
 	if err != nil {
-		return FileInfo{}, status.Wrap(status.KindNotFound, "stat ftps path", err)
+		return FileInfo{}, status.Wrap(status.KindNotFound, "stat "+t.logProtocolName()+" path", err)
 	}
 	return FileInfo{
 		Path:  cleanRemote(remotePath),
@@ -177,17 +187,17 @@ func (t *FTPSTransport) HashFile(ctx context.Context, remotePath string) (FileIn
 	}
 	reader, err := conn.Retr(cleanRemote(remotePath))
 	if err != nil {
-		return FileInfo{}, status.Wrap(status.KindNotFound, "retrieve ftps file for hash", err)
+		return FileInfo{}, status.Wrap(status.KindNotFound, "retrieve "+t.logProtocolName()+" file for hash", err)
 	}
 	defer reader.Close()
 
 	sum, err := hashStream(reader)
 	if err != nil {
-		return FileInfo{}, status.Wrap(status.KindInternal, "hash ftps file", err)
+		return FileInfo{}, status.Wrap(status.KindInternal, "hash "+t.logProtocolName()+" file", err)
 	}
 	entry, err := conn.GetEntry(cleanRemote(remotePath))
 	if err != nil {
-		return FileInfo{}, status.Wrap(status.KindNotFound, "stat ftps file for hash", err)
+		return FileInfo{}, status.Wrap(status.KindNotFound, "stat "+t.logProtocolName()+" file for hash", err)
 	}
 	return FileInfo{
 		Path:   cleanRemote(remotePath),
@@ -207,7 +217,7 @@ func (t *FTPSTransport) ReadDir(ctx context.Context, remotePath string) ([]FileI
 	}
 	entries, err := conn.List(cleanRemote(remotePath))
 	if err != nil {
-		return nil, status.Wrap(status.KindNotFound, "list ftps dir", err)
+		return nil, status.Wrap(status.KindNotFound, "list "+t.logProtocolName()+" dir", err)
 	}
 	result := make([]FileInfo, 0, len(entries))
 	for _, entry := range entries {
@@ -238,7 +248,7 @@ func (t *FTPSTransport) Rename(ctx context.Context, fromPath string, toPath stri
 		return err
 	}
 	if err := conn.Rename(cleanRemote(fromPath), cleanRemote(toPath)); err != nil {
-		return status.Wrap(status.KindInternal, "rename ftps path", err)
+		return status.Wrap(status.KindInternal, "rename "+t.logProtocolName()+" path", err)
 	}
 	return nil
 }
@@ -252,7 +262,7 @@ func (t *FTPSTransport) Mkdir(ctx context.Context, remotePath string) error {
 		return err
 	}
 	if err := conn.MakeDir(cleanRemote(remotePath)); err != nil {
-		return status.Wrap(status.KindInternal, "mkdir ftps path", err)
+		return status.Wrap(status.KindInternal, "mkdir "+t.logProtocolName()+" path", err)
 	}
 	return nil
 }
@@ -283,12 +293,18 @@ func (t *FTPSTransport) RemoveAll(ctx context.Context, remotePath string) error 
 	}
 	if entry.Type == ftp.EntryTypeFolder {
 		if err := conn.RemoveDirRecur(target); err != nil {
-			return status.Wrap(status.KindInternal, "remove ftps dir", err)
+			if isMissingFTP(err) {
+				return nil
+			}
+			return status.Wrap(status.KindInternal, "remove "+t.logProtocolName()+" dir", err)
 		}
 		return nil
 	}
 	if err := conn.Delete(target); err != nil {
-		return status.Wrap(status.KindInternal, "delete ftps file", err)
+		if isMissingFTP(err) {
+			return nil
+		}
+		return status.Wrap(status.KindInternal, "delete "+t.logProtocolName()+" file", err)
 	}
 	return nil
 }
@@ -308,7 +324,7 @@ func (t *FTPSTransport) Exists(ctx context.Context, remotePath string) (bool, er
 	if isMissingFTP(err) {
 		return false, nil
 	}
-	return false, status.Wrap(status.KindInternal, "stat ftps path", err)
+	return false, status.Wrap(status.KindInternal, "stat "+t.logProtocolName()+" path", err)
 }
 
 func (t *FTPSTransport) probeFilesystem(ctx context.Context) error {
@@ -321,10 +337,10 @@ func (t *FTPSTransport) probeFilesystem(ctx context.Context) error {
 	_ = t.RemoveAll(ctx, stage)
 	_ = t.RemoveAll(ctx, swapped)
 	if err := t.Mkdir(ctx, stage); err != nil {
-		return status.Wrap(status.KindInternal, "probe ftps mkdir", err)
+		return status.Wrap(status.KindInternal, "probe "+t.logProtocolName()+" mkdir", err)
 	}
 	if err := t.Rename(ctx, stage, swapped); err != nil {
-		return status.Wrap(status.KindUnsupported, "probe ftps rename", err)
+		return status.Wrap(status.KindUnsupported, "probe "+t.logProtocolName()+" rename", err)
 	}
 	_ = t.RemoveAll(ctx, swapped)
 	return nil
@@ -361,15 +377,15 @@ func (t *FTPSTransport) connectLocked(ctx context.Context) (*ftp.ServerConn, err
 
 	conn, err := ftp.Dial(address, options...)
 	if err != nil {
-		return nil, status.Wrap(status.KindTemporary, "dial ftps transport", err)
+		return nil, status.Wrap(status.KindTemporary, "dial "+t.logProtocolName()+" transport", err)
 	}
 	if err := conn.Login(t.User, t.Password); err != nil {
 		_ = conn.Quit()
-		return nil, status.Wrap(status.KindConfig, "login ftps transport", err)
+		return nil, status.Wrap(status.KindConfig, "login "+t.logProtocolName()+" transport", err)
 	}
 	if err := conn.Type(ftp.TransferTypeBinary); err != nil {
 		_ = conn.Quit()
-		return nil, status.Wrap(status.KindInternal, "set ftps binary mode", err)
+		return nil, status.Wrap(status.KindInternal, "set "+t.logProtocolName()+" binary mode", err)
 	}
 	t.conn = conn
 	return t.conn, nil
@@ -397,7 +413,7 @@ func (t *FTPSTransport) mkdirAllLocked(conn *ftp.ServerConn, remotePath string) 
 			if _, statErr := conn.GetEntry(current); statErr == nil {
 				continue
 			}
-			return status.Wrap(status.KindInternal, "mkdirall ftps path", err)
+			return status.Wrap(status.KindInternal, "mkdirall "+t.logProtocolName()+" path", err)
 		}
 	}
 	return nil
@@ -423,9 +439,16 @@ func (t *FTPSTransport) writeBytes(ctx context.Context, remotePath string, data 
 		return err
 	}
 	if err := conn.Stor(cleanRemote(remotePath), bytes.NewReader(data)); err != nil {
-		return status.Wrap(status.KindInternal, "store ftps file", err)
+		return status.Wrap(status.KindInternal, "store "+t.logProtocolName()+" file", err)
 	}
 	return nil
+}
+
+func (t *FTPSTransport) logProtocolName() string {
+	if !t.UseTLS {
+		return "ftp"
+	}
+	return "ftps"
 }
 
 func cleanRemote(value string) string {

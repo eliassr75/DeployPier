@@ -1,6 +1,7 @@
 package build
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -27,11 +28,13 @@ type Builder struct {
 }
 
 type Release struct {
-	ID           string
-	Path         string
-	BundlePath   string
-	ManifestPath string
-	Manifest     Manifest
+	ID                  string
+	Path                string
+	BundlePath          string
+	ManifestPath        string
+	ArchivePath         string
+	AllowExistingRemote bool
+	Manifest            Manifest
 }
 
 type Manifest struct {
@@ -150,6 +153,14 @@ func (b *Builder) Build(ctx context.Context, cfg config.Config) (Release, error)
 		return Release{}, status.Wrap(status.KindInternal, "write manifest", err)
 	}
 
+	archivePath := ""
+	if cfg.Release.UploadMode == "archive" {
+		archivePath = filepath.Join(releasePath, "release.zip")
+		if err := WriteArchive(archivePath, bundlePath, manifest.Files); err != nil {
+			return Release{}, err
+		}
+	}
+
 	if err := pruneReleases(cfg.Release.Directory, cfg.Release.Retain); err != nil {
 		return Release{}, status.Wrap(status.KindInternal, "prune retained releases", err)
 	}
@@ -159,6 +170,7 @@ func (b *Builder) Build(ctx context.Context, cfg config.Config) (Release, error)
 		Path:         releasePath,
 		BundlePath:   bundlePath,
 		ManifestPath: manifestPath,
+		ArchivePath:  archivePath,
 		Manifest:     manifest,
 	}, nil
 }
@@ -218,8 +230,68 @@ func (b *Builder) Load(_ context.Context, cfg config.Config, releaseID string) (
 		Path:         releasePath,
 		BundlePath:   filepath.Join(releasePath, "bundle"),
 		ManifestPath: manifestPath,
+		ArchivePath:  filepath.Join(releasePath, "release.zip"),
 		Manifest:     manifest,
 	}, nil
+}
+
+func WriteArchive(targetPath string, bundlePath string, files []ManifestFile) error {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return status.Wrap(status.KindInternal, "prepare archive directory", err)
+	}
+
+	file, err := os.Create(targetPath)
+	if err != nil {
+		return status.Wrap(status.KindInternal, "create release archive", err)
+	}
+	defer file.Close()
+
+	archive := zip.NewWriter(file)
+
+	for _, entry := range files {
+		sourcePath := filepath.Join(bundlePath, filepath.FromSlash(entry.Path))
+		if err := appendArchiveFile(archive, sourcePath, entry); err != nil {
+			_ = archive.Close()
+			return err
+		}
+	}
+
+	if err := archive.Close(); err != nil {
+		return status.Wrap(status.KindInternal, "finalize release archive", err)
+	}
+
+	return nil
+}
+
+func appendArchiveFile(archive *zip.Writer, sourcePath string, entry ManifestFile) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return status.Wrap(status.KindNotFound, "open archive source file", err)
+	}
+	defer source.Close()
+
+	info, err := source.Stat()
+	if err != nil {
+		return status.Wrap(status.KindInternal, "stat archive source file", err)
+	}
+
+	header, err := zip.FileInfoHeader(info)
+	if err != nil {
+		return status.Wrap(status.KindInternal, "create archive header", err)
+	}
+	header.Name = filepath.ToSlash(entry.Path)
+	header.Method = zip.Deflate
+
+	writer, err := archive.CreateHeader(header)
+	if err != nil {
+		return status.Wrap(status.KindInternal, "create archive entry", err)
+	}
+
+	if _, err := io.Copy(writer, source); err != nil {
+		return status.Wrap(status.KindInternal, "write archive entry", err)
+	}
+
+	return nil
 }
 
 func deriveSelfExcludes(cfg config.Config) []string {

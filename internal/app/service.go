@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -37,6 +38,7 @@ type Service struct {
 	hooks      hooks.Runner
 	postDeploy *postdeploy.Client
 	now        func() time.Time
+	progress   ProgressReporter
 }
 
 type Plan struct {
@@ -89,6 +91,20 @@ type PushResult struct {
 	Warnings       []string
 }
 
+type ProgressEvent struct {
+	Phase          string
+	Message        string
+	Path           string
+	Current        int
+	Total          int
+	CompletedBytes int64
+	TotalBytes     int64
+}
+
+type ProgressReporter func(ProgressEvent)
+
+const remoteLockStaleAfter = 20 * time.Minute
+
 func New(cfg config.Config) (*Service, error) {
 	builder := build.NewBuilder()
 	store := state.New(cfg.State.File)
@@ -110,6 +126,10 @@ func New(cfg config.Config) (*Service, error) {
 		postDeploy: postdeploy.NewClient(),
 		now:        time.Now,
 	}, nil
+}
+
+func (s *Service) SetProgressReporter(reporter ProgressReporter) {
+	s.progress = reporter
 }
 
 func (s *Service) Plan(ctx context.Context) (Plan, error) {
@@ -134,7 +154,7 @@ func (s *Service) Plan(ctx context.Context) (Plan, error) {
 		Steps: []string{
 			"doctor validates config, hooks, and local transport health",
 			"build creates a release directory with bundle files and manifest.json",
-			"push uploads a built release, synchronizes public assets, updates the current release pointer, and can call the Laravel post-deploy hook",
+			"push builds a new release when -release is omitted, uploads it, synchronizes public assets, updates the current release pointer, and can call the Laravel post-deploy hook",
 			"rollback points activation back to the previous recorded release",
 		},
 	}, nil
@@ -200,6 +220,7 @@ func (s *Service) Doctor(ctx context.Context) ([]DoctorCheck, error) {
 }
 
 func (s *Service) Build(ctx context.Context) (build.Release, error) {
+	s.emitProgress(ProgressEvent{Phase: "build", Message: "executando build local"})
 	if _, err := s.runHooks(ctx, "before_build", hooks.Metadata{
 		"project": s.cfg.Project.Name,
 	}); err != nil {
@@ -227,6 +248,7 @@ func (s *Service) Build(ctx context.Context) (build.Release, error) {
 		return build.Release{}, err
 	}
 
+	s.emitProgress(ProgressEvent{Phase: "build", Message: "release local pronta", Path: release.Path})
 	return release, nil
 }
 
@@ -327,6 +349,7 @@ func (s *Service) InspectRemote(ctx context.Context) (RemoteInspection, error) {
 }
 
 func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool) (PushResult, error) {
+	s.emitProgress(ProgressEvent{Phase: "migrations", Message: "analisando migrations"})
 	assessment, err := migrations.Assess(ctx, s.cfg.Project.Root)
 	if err != nil {
 		return PushResult{}, err
@@ -339,11 +362,12 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 		}, status.Wrap(status.KindConflict, "assess migrations", fmt.Errorf("automatic post-deploy blocked by risky migrations"))
 	}
 
-	release, err := s.resolveRelease(ctx, releaseID)
+	release, err := s.prepareReleaseForPush(ctx, releaseID)
 	if err != nil {
 		return PushResult{}, err
 	}
 
+	s.emitProgress(ProgressEvent{Phase: "lock", Message: "adquirindo lock remoto"})
 	unlock, err := s.acquireRemoteLock(ctx, release.ID)
 	if err != nil {
 		return PushResult{}, err
@@ -355,6 +379,7 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 		Status:    "success",
 		Warnings:  append([]string{}, assessment.Warnings...),
 	}
+	ref, commit := currentGitMetadata(ctx, s.cfg.Project.Root)
 	if s.cfg.PostDeploy.Mode == "bypass" && len(assessment.Blocking) > 0 {
 		result.Warnings = append(result.Warnings, "post-deploy bypass enabled; running hook despite migration policy blocks")
 		result.Warnings = append(result.Warnings, assessment.Blocking...)
@@ -369,13 +394,46 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 	}
 
 	remoteReleasePath := s.remoteReleasePath(release.ID)
-	upload, err := s.transport.UploadRelease(ctx, release, remoteReleasePath)
+	uploadRelease, remoteOpsWarnings, err := s.prepareRemoteRelease(ctx, release, remoteReleasePath, ref, commit)
+	result.Warnings = append(result.Warnings, remoteOpsWarnings...)
 	if err != nil {
 		return result, err
 	}
+	uploadRelease, err = s.prepareUploadRelease(ctx, uploadRelease)
+	if err != nil {
+		return result, err
+	}
+	s.emitProgress(ProgressEvent{Phase: "upload", Message: "iniciando upload da release"})
+	upload, err := s.transport.UploadRelease(ctx, uploadRelease, remoteReleasePath, func(progress transport.UploadProgress) {
+		s.emitProgress(ProgressEvent{
+			Phase:          "upload",
+			Message:        "enviando arquivos",
+			Path:           progress.Path,
+			Current:        progress.UploadedFiles,
+			Total:          progress.TotalFiles,
+			CompletedBytes: progress.UploadedBytes,
+			TotalBytes:     progress.TotalBytes,
+		})
+	})
+	if err != nil {
+		return result, err
+	}
+	if s.cfg.Release.UploadMode == "archive" {
+		s.emitProgress(ProgressEvent{Phase: "extract", Message: "extraindo release.zip no servidor"})
+		if _, err := s.postDeploy.ExtractRelease(ctx, s.cfg, postdeploy.ExtractReleaseInput{
+			Release:    uploadRelease,
+			RemotePath: upload.RemotePath,
+			Ref:        ref,
+			Commit:     commit,
+		}); err != nil {
+			return result, status.Wrap(status.KindConflict, "extract remote release", err)
+		}
+	}
+	s.emitProgress(ProgressEvent{Phase: "verify", Message: "validando manifesto remoto"})
 	if err := s.validateRemoteRelease(ctx, release, upload.RemotePath); err != nil {
 		return result, err
 	}
+	s.emitProgress(ProgressEvent{Phase: "env", Message: "preparando .env da release"})
 	if err := s.ensureReleaseEnvironment(ctx, upload.RemotePath); err != nil {
 		return result, err
 	}
@@ -399,10 +457,12 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 	}
 
 	if skipActivate {
+		s.emitProgress(ProgressEvent{Phase: "done", Message: "upload concluido sem ativacao"})
 		_ = s.pruneRemoteReleases(ctx)
 		return result, nil
 	}
 
+	s.emitProgress(ProgressEvent{Phase: "activate", Message: "ativando release"})
 	beforeActivate, err := s.runHooks(ctx, "before_activate", hooks.Metadata{
 		"release_id": release.ID,
 		"remote":     upload.RemotePath,
@@ -448,6 +508,7 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 		} else {
 			result.Warnings = append(result.Warnings, "manual migration required for detected migration files")
 		}
+		s.emitProgress(ProgressEvent{Phase: "done", Message: "deploy concluido com migration manual pendente"})
 		return result, nil
 	}
 
@@ -456,7 +517,7 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 	}
 
 	if s.cfg.PostDeploy.Mode == "auto" || s.cfg.PostDeploy.Mode == "bypass" {
-		ref, commit := currentGitMetadata(ctx, s.cfg.Project.Root)
+		s.emitProgress(ProgressEvent{Phase: "post_deploy", Message: "executando hook pos-deploy"})
 		if _, err := s.postDeploy.Call(ctx, s.cfg, release, upload.RemotePath, ref, commit); err != nil {
 			result.Status = "failed_post_deploy"
 			result.Warnings = append(result.Warnings, err.Error())
@@ -465,6 +526,7 @@ func (s *Service) Push(ctx context.Context, releaseID string, skipActivate bool)
 	}
 
 	_ = s.pruneRemoteReleases(ctx)
+	s.emitProgress(ProgressEvent{Phase: "done", Message: "deploy concluido"})
 
 	return result, nil
 }
@@ -518,6 +580,96 @@ func (s *Service) runHooks(ctx context.Context, phase string, metadata hooks.Met
 	return s.hooks.RunPhase(ctx, phase, s.cfg.Hooks.ForPhase(phase), metadata)
 }
 
+func (s *Service) emitProgress(event ProgressEvent) {
+	if s.progress != nil {
+		s.progress(event)
+	}
+}
+
+func (s *Service) prepareReleaseForPush(ctx context.Context, releaseID string) (build.Release, error) {
+	if strings.TrimSpace(releaseID) == "" {
+		return s.Build(ctx)
+	}
+	return s.resolveRelease(ctx, releaseID)
+}
+
+func (s *Service) prepareRemoteRelease(ctx context.Context, release build.Release, remoteReleasePath string, ref string, commit string) (build.Release, []string, error) {
+	mode := strings.ToLower(strings.TrimSpace(s.cfg.PostDeploy.RemoteOps))
+	if mode == "" || mode == "off" {
+		return release, nil, nil
+	}
+	if s.cfg.Remote.Layout != "release-based" {
+		return s.handleRemoteOpsSkip(release, mode, "remote ops require remote.layout=release-based")
+	}
+	if strings.TrimSpace(s.cfg.PostDeploy.HookURL) == "" || strings.TrimSpace(s.cfg.PostDeploy.KeyID) == "" || strings.TrimSpace(s.cfg.PostDeploy.Secret) == "" {
+		return s.handleRemoteOpsSkip(release, mode, "remote ops require a configured hook URL and credentials")
+	}
+
+	currentReleaseID, err := s.activator.Current(ctx)
+	if err != nil {
+		if statusKind(err) == status.KindNotFound {
+			return release, nil, nil
+		}
+		return s.handleRemoteOpsSkip(release, mode, err.Error())
+	}
+	if strings.TrimSpace(currentReleaseID) == "" || currentReleaseID == release.ID {
+		return release, nil, nil
+	}
+
+	currentManifest, err := s.loadRemoteManifest(ctx, currentReleaseID)
+	if err != nil {
+		if statusKind(err) == status.KindNotFound {
+			return s.handleRemoteOpsSkip(release, mode, "current remote manifest was not found; falling back to full upload")
+		}
+		return s.handleRemoteOpsSkip(release, mode, err.Error())
+	}
+
+	deltaFiles, removedPaths := diffManifestFiles(currentManifest, release.Manifest)
+	if len(deltaFiles) == len(release.Manifest.Files) && len(removedPaths) == 0 {
+		return release, nil, nil
+	}
+
+	s.emitProgress(ProgressEvent{Phase: "remote_ops", Message: "preparando release remota via Laravel"})
+	if _, err := s.postDeploy.PrepareRelease(ctx, s.cfg, postdeploy.PrepareReleaseInput{
+		Release:       release,
+		BaseReleaseID: currentReleaseID,
+		RemotePath:    remoteReleasePath,
+		ChangedPaths:  manifestPaths(deltaFiles),
+		RemovedPaths:  removedPaths,
+		Ref:           ref,
+		Commit:        commit,
+	}); err != nil {
+		return build.Release{}, nil, status.Wrap(status.KindConflict, "prepare remote release", err)
+	}
+
+	uploadRelease := release
+	uploadRelease.Manifest.Files = deltaFiles
+	uploadRelease.ArchivePath = ""
+	uploadRelease.AllowExistingRemote = true
+	return uploadRelease, []string{
+		fmt.Sprintf("remote ops prepared %s from active release %s; uploading %d changed files and pruning %d removed paths", release.ID, currentReleaseID, len(deltaFiles), len(removedPaths)),
+	}, nil
+}
+
+func (s *Service) prepareUploadRelease(ctx context.Context, release build.Release) (build.Release, error) {
+	if s.cfg.Release.UploadMode != "archive" {
+		return release, nil
+	}
+
+	archivePath := filepath.Join(release.Path, "upload-package.zip")
+
+	if err := build.WriteArchive(archivePath, release.BundlePath, release.Manifest.Files); err != nil {
+		return build.Release{}, err
+	}
+	release.ArchivePath = archivePath
+	select {
+	case <-ctx.Done():
+		return build.Release{}, ctx.Err()
+	default:
+	}
+	return release, nil
+}
+
 func (s *Service) resolveRelease(ctx context.Context, releaseID string) (build.Release, error) {
 	target := releaseID
 	if target == "" {
@@ -534,12 +686,41 @@ func (s *Service) resolveRelease(ctx context.Context, releaseID string) (build.R
 	return s.builder.Load(ctx, s.cfg, target)
 }
 
+func (s *Service) handleRemoteOpsSkip(release build.Release, mode string, message string) (build.Release, []string, error) {
+	if mode == "required" {
+		return build.Release{}, nil, status.Wrap(status.KindConflict, "prepare remote release", errors.New(message))
+	}
+	return release, []string{"remote ops fallback: " + message}, nil
+}
+
 func statPath(path string) error {
 	_, err := os.Stat(path)
 	return err
 }
 
 func (s *Service) postDeployReport() status.Report {
+	if s.cfg.Release.UploadMode == "archive" {
+		if strings.TrimSpace(s.cfg.PostDeploy.HookURL) == "" {
+			return status.Report{Level: status.LevelFail, Code: "missing_hook_url", Message: "archive upload mode requires a configured deploy hook URL"}
+		}
+		if strings.TrimSpace(s.cfg.PostDeploy.KeyID) == "" || strings.TrimSpace(s.cfg.PostDeploy.Secret) == "" {
+			return status.Report{Level: status.LevelFail, Code: "missing_credentials", Message: "archive upload mode requires deploy hook credentials"}
+		}
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(s.cfg.PostDeploy.HookURL)), "https://") {
+			return status.Report{Level: status.LevelFail, Code: "invalid_hook_url", Message: "deploy hook URL must use https"}
+		}
+	}
+	if s.cfg.PostDeploy.RemoteOps != "" && s.cfg.PostDeploy.RemoteOps != "off" {
+		if strings.TrimSpace(s.cfg.PostDeploy.HookURL) == "" {
+			return status.Report{Level: status.LevelFail, Code: "missing_hook_url", Message: "remote ops require a configured deploy hook URL"}
+		}
+		if strings.TrimSpace(s.cfg.PostDeploy.KeyID) == "" || strings.TrimSpace(s.cfg.PostDeploy.Secret) == "" {
+			return status.Report{Level: status.LevelFail, Code: "missing_credentials", Message: "remote ops require deploy hook credentials"}
+		}
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(s.cfg.PostDeploy.HookURL)), "https://") {
+			return status.Report{Level: status.LevelFail, Code: "invalid_hook_url", Message: "deploy hook URL must use https"}
+		}
+	}
 	if s.cfg.PostDeploy.Mode == "skip" {
 		return status.Report{Level: status.LevelWarn, Code: "disabled", Message: "post-deploy hook skipped"}
 	}
@@ -764,7 +945,12 @@ func (s *Service) acquireRemoteLock(ctx context.Context, releaseID string) (func
 		return nil, err
 	}
 	if err := s.transport.Mkdir(ctx, lockPath); err != nil {
-		return nil, status.Wrap(status.KindConflict, "acquire remote deploy lock", err)
+		if !isRemoteLockConflict(err) {
+			return nil, status.Wrap(status.KindConflict, "acquire remote deploy lock", err)
+		}
+		if err := s.recoverRemoteLock(ctx, lockPath); err != nil {
+			return nil, err
+		}
 	}
 	lockData := fmt.Sprintf("release_id=%s\ncreated_at=%s\n", releaseID, s.now().UTC().Format(time.RFC3339))
 	if err := s.transport.WriteFile(ctx, joinServicePath(lockPath, "owner.txt"), []byte(lockData)); err != nil {
@@ -774,6 +960,163 @@ func (s *Service) acquireRemoteLock(ctx context.Context, releaseID string) (func
 	return func() {
 		_ = s.transport.RemoveAll(context.Background(), lockPath)
 	}, nil
+}
+
+func (s *Service) recoverRemoteLock(ctx context.Context, lockPath string) error {
+	ownerPath := joinServicePath(lockPath, "owner.txt")
+	raw, err := s.transport.ReadFile(ctx, ownerPath)
+	if err != nil {
+		if removeErr := s.removeRemoteLock(ctx, lockPath); removeErr != nil {
+			return status.Wrap(status.KindConflict, "recover remote deploy lock", removeErr)
+		}
+		return nil
+	}
+
+	owner := parseRemoteLockOwner(string(raw))
+	if owner.CreatedAt.IsZero() {
+		if removeErr := s.removeRemoteLock(ctx, lockPath); removeErr != nil {
+			return status.Wrap(status.KindConflict, "recover remote deploy lock", removeErr)
+		}
+		return nil
+	}
+
+	if s.now().UTC().Sub(owner.CreatedAt) > remoteLockStaleAfter {
+		if removeErr := s.removeRemoteLock(ctx, lockPath); removeErr != nil {
+			return status.Wrap(status.KindConflict, "recover remote deploy lock", removeErr)
+		}
+		return nil
+	}
+
+	releaseLabel := owner.ReleaseID
+	if strings.TrimSpace(releaseLabel) == "" {
+		releaseLabel = "unknown"
+	}
+	return status.Wrap(status.KindConflict, "acquire remote deploy lock", fmt.Errorf("deploy lock is active for release %s since %s", releaseLabel, owner.CreatedAt.Format(time.RFC3339)))
+}
+
+func (s *Service) removeRemoteLock(ctx context.Context, lockPath string) error {
+	err := s.transport.RemoveAll(ctx, lockPath)
+	if err == nil {
+		return nil
+	}
+	if isMissingLockRemoval(err) {
+		return nil
+	}
+	exists, existsErr := s.transport.Exists(ctx, lockPath)
+	if existsErr == nil && !exists {
+		return nil
+	}
+	return err
+}
+
+type remoteLockOwner struct {
+	ReleaseID string
+	CreatedAt time.Time
+}
+
+func parseRemoteLockOwner(raw string) remoteLockOwner {
+	owner := remoteLockOwner{}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "release_id":
+			owner.ReleaseID = strings.TrimSpace(value)
+		case "created_at":
+			if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(value)); err == nil {
+				owner.CreatedAt = parsed
+			}
+		}
+	}
+	return owner
+}
+
+func isRemoteLockConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "file exists") ||
+		strings.Contains(message, "already exists")
+}
+
+func isMissingLockRemoval(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *status.Error
+	if errors.As(err, &statusErr) && statusErr.Kind == status.KindNotFound {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such file or directory") ||
+		strings.Contains(message, "not found") ||
+		strings.Contains(message, "file unavailable")
+}
+
+func (s *Service) loadRemoteManifest(ctx context.Context, releaseID string) (build.Manifest, error) {
+	raw, err := s.transport.ReadFile(ctx, joinServicePath(s.remoteReleasePath(releaseID), "manifest.json"))
+	if err != nil {
+		return build.Manifest{}, status.Wrap(status.KindNotFound, "read remote release manifest", err)
+	}
+
+	var manifest build.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return build.Manifest{}, status.Wrap(status.KindConflict, "decode remote release manifest", err)
+	}
+	return manifest, nil
+}
+
+func diffManifestFiles(previous build.Manifest, current build.Manifest) ([]build.ManifestFile, []string) {
+	previousByPath := make(map[string]build.ManifestFile, len(previous.Files))
+	for _, file := range previous.Files {
+		previousByPath[file.Path] = file
+	}
+
+	currentByPath := make(map[string]build.ManifestFile, len(current.Files))
+	changed := make([]build.ManifestFile, 0, len(current.Files))
+	for _, file := range current.Files {
+		currentByPath[file.Path] = file
+		previousFile, ok := previousByPath[file.Path]
+		if !ok || previousFile.SHA256 != file.SHA256 || previousFile.Size != file.Size {
+			changed = append(changed, file)
+		}
+	}
+
+	removed := make([]string, 0)
+	for _, file := range previous.Files {
+		if _, ok := currentByPath[file.Path]; !ok {
+			removed = append(removed, file.Path)
+		}
+	}
+
+	sort.Slice(changed, func(i, j int) bool {
+		return changed[i].Path < changed[j].Path
+	})
+	sort.Strings(removed)
+	return changed, removed
+}
+
+func manifestPaths(files []build.ManifestFile) []string {
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+	return paths
+}
+
+func statusKind(err error) status.Kind {
+	var statusErr *status.Error
+	if errors.As(err, &statusErr) {
+		return statusErr.Kind
+	}
+	return ""
 }
 
 func (s *Service) validateRemoteRelease(ctx context.Context, release build.Release, remotePath string) error {

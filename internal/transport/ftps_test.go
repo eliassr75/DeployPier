@@ -46,3 +46,15 @@ func TestIsMissingFTP(t *testing.T) {
 		})
 	}
 }
+
+func TestFTPSTransportLogProtocolName(t *testing.T) {
+	ftpTransport := &FTPSTransport{UseTLS: false}
+	if ftpTransport.logProtocolName() != "ftp" {
+		t.Fatalf("expected ftp protocol label, got %s", ftpTransport.logProtocolName())
+	}
+
+	ftpsTransport := &FTPSTransport{UseTLS: true}
+	if ftpsTransport.logProtocolName() != "ftps" {
+		t.Fatalf("expected ftps protocol label, got %s", ftpsTransport.logProtocolName())
+	}
+}

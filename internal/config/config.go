@@ -43,8 +43,9 @@ type BuildConfig struct {
 }
 
 type ReleaseConfig struct {
-	Directory string `yaml:"directory"`
-	Retain    int    `yaml:"retain"`
+	Directory  string `yaml:"directory"`
+	Retain     int    `yaml:"retain"`
+	UploadMode string `yaml:"upload_mode"`
 }
 
 type TransportConfig struct {
@@ -72,14 +73,17 @@ type RuntimeConfig struct {
 }
 
 type PostDeployConfig struct {
-	Mode       string `yaml:"mode"`
-	HookURLEnv string `yaml:"hook_url_env"`
-	KeyIDEnv   string `yaml:"key_id_env"`
-	SecretEnv  string `yaml:"secret_env"`
-	SmokeURL   string `yaml:"smoke_url"`
-	HookURL    string `yaml:"-"`
-	KeyID      string `yaml:"-"`
-	Secret     string `yaml:"-"`
+	Mode              string `yaml:"mode"`
+	RemoteOps         string `yaml:"remote_ops"`
+	HookURLEnv        string `yaml:"hook_url_env"`
+	KeyIDEnv          string `yaml:"key_id_env"`
+	SecretEnv         string `yaml:"secret_env"`
+	RequestTimeoutEnv string `yaml:"request_timeout_env"`
+	SmokeURL          string `yaml:"smoke_url"`
+	HookURL           string `yaml:"-"`
+	KeyID             string `yaml:"-"`
+	Secret            string `yaml:"-"`
+	RequestTimeout    string `yaml:"-"`
 }
 
 type StateConfig struct {
@@ -177,8 +181,9 @@ func defaults(cwd string) Config {
 			NodeCommand: "npm ci && npm run build",
 		},
 		Release: ReleaseConfig{
-			Directory: filepath.Join(baseStateDir, "releases"),
-			Retain:    5,
+			Directory:  filepath.Join(baseStateDir, "releases"),
+			Retain:     5,
+			UploadMode: "files",
 		},
 		Transport: TransportConfig{
 			Kind:     "local",
@@ -193,10 +198,12 @@ func defaults(cwd string) Config {
 		},
 		Runtime: RuntimeConfig{},
 		PostDeploy: PostDeployConfig{
-			Mode:       "skip",
-			HookURLEnv: "DEPLOY_HOOK_URL",
-			KeyIDEnv:   "DEPLOY_HOOK_KEY_ID",
-			SecretEnv:  "DEPLOY_HOOK_SECRET",
+			Mode:              "skip",
+			RemoteOps:         "off",
+			HookURLEnv:        "DEPLOY_HOOK_URL",
+			KeyIDEnv:          "DEPLOY_HOOK_KEY_ID",
+			SecretEnv:         "DEPLOY_HOOK_SECRET",
+			RequestTimeoutEnv: "DEPLOY_HOOK_TIMEOUT",
 		},
 		State: StateConfig{
 			File: filepath.Join(baseStateDir, "state.json"),
@@ -249,6 +256,9 @@ func applyEnvOverrides(cfg *Config, env map[string]string, baseDir string) {
 		if parsed, err := strconv.Atoi(value); err == nil {
 			cfg.Release.Retain = parsed
 		}
+	}
+	if value := firstNonEmpty(env, EnvPrefix+"RELEASE_UPLOAD_MODE", LegacyEnvPrefix+"RELEASE_UPLOAD_MODE"); value != "" {
+		cfg.Release.UploadMode = value
 	}
 	if value := firstNonEmpty(env, EnvPrefix+"STATE_FILE", LegacyEnvPrefix+"STATE_FILE"); value != "" {
 		cfg.State.File = resolvePath(baseDir, value)
@@ -303,6 +313,9 @@ func applyEnvOverrides(cfg *Config, env map[string]string, baseDir string) {
 	if value := firstNonEmpty(env, EnvPrefix+"POST_DEPLOY_MODE", LegacyEnvPrefix+"POST_DEPLOY_MODE"); value != "" {
 		cfg.PostDeploy.Mode = value
 	}
+	if value := firstNonEmpty(env, EnvPrefix+"POST_DEPLOY_REMOTE_OPS", LegacyEnvPrefix+"POST_DEPLOY_REMOTE_OPS"); value != "" {
+		cfg.PostDeploy.RemoteOps = value
+	}
 	if value := firstNonEmpty(env, EnvPrefix+"POST_DEPLOY_HOOK_URL_ENV", LegacyEnvPrefix+"POST_DEPLOY_HOOK_URL_ENV"); value != "" {
 		cfg.PostDeploy.HookURLEnv = value
 	}
@@ -311,6 +324,9 @@ func applyEnvOverrides(cfg *Config, env map[string]string, baseDir string) {
 	}
 	if value := firstNonEmpty(env, EnvPrefix+"POST_DEPLOY_SECRET_ENV", LegacyEnvPrefix+"POST_DEPLOY_SECRET_ENV"); value != "" {
 		cfg.PostDeploy.SecretEnv = value
+	}
+	if value := firstNonEmpty(env, EnvPrefix+"POST_DEPLOY_REQUEST_TIMEOUT_ENV", LegacyEnvPrefix+"POST_DEPLOY_REQUEST_TIMEOUT_ENV"); value != "" {
+		cfg.PostDeploy.RequestTimeoutEnv = value
 	}
 	if value := firstNonEmpty(env, EnvPrefix+"POST_DEPLOY_SMOKE_URL", LegacyEnvPrefix+"POST_DEPLOY_SMOKE_URL"); value != "" {
 		cfg.PostDeploy.SmokeURL = value
@@ -323,6 +339,9 @@ func applyEnvOverrides(cfg *Config, env map[string]string, baseDir string) {
 	}
 	if cfg.PostDeploy.SecretEnv != "" {
 		cfg.PostDeploy.Secret = env[cfg.PostDeploy.SecretEnv]
+	}
+	if cfg.PostDeploy.RequestTimeoutEnv != "" {
+		cfg.PostDeploy.RequestTimeout = env[cfg.PostDeploy.RequestTimeoutEnv]
 	}
 	if value := firstNonEmpty(env, EnvPrefix+"ACTIVATION_KIND", LegacyEnvPrefix+"ACTIVATION_KIND"); value != "" {
 		cfg.Activation.Kind = value
@@ -399,6 +418,12 @@ func (c Config) Validate() error {
 	if c.Release.Retain < 1 {
 		problems = append(problems, "release.retain must be at least 1")
 	}
+	if c.Release.UploadMode == "" {
+		problems = append(problems, "release.upload_mode is required")
+	}
+	if c.Release.UploadMode != "" && !contains([]string{"files", "archive"}, c.Release.UploadMode) {
+		problems = append(problems, "release.upload_mode must be one of files, archive")
+	}
 	if c.Transport.Kind == "" {
 		problems = append(problems, "transport.kind is required")
 	}
@@ -448,6 +473,12 @@ func (c Config) Validate() error {
 	}
 	if c.PostDeploy.Mode != "" && !contains([]string{"auto", "manual", "skip", "bypass"}, c.PostDeploy.Mode) {
 		problems = append(problems, "post_deploy.mode must be one of auto, manual, skip, bypass")
+	}
+	if c.PostDeploy.RemoteOps == "" {
+		problems = append(problems, "post_deploy.remote_ops is required")
+	}
+	if c.PostDeploy.RemoteOps != "" && !contains([]string{"off", "auto", "required"}, c.PostDeploy.RemoteOps) {
+		problems = append(problems, "post_deploy.remote_ops must be one of off, auto, required")
 	}
 	if c.State.File == "" {
 		problems = append(problems, "state.file is required")

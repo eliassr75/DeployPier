@@ -195,13 +195,22 @@ func runBuild(ctx context.Context, args []string, stdout io.Writer, env []string
 	if err != nil {
 		return err
 	}
+	renderer := newProgressRenderer(stdout)
+	service.SetProgressReporter(renderer.Handle)
+	defer renderer.Finish()
 
 	release, err := service.Build(ctx)
 	if err != nil {
 		return err
 	}
 
-	_, err = fmt.Fprintf(stdout, "release_id: %s\nrelease_path: %s\nmanifest: %s\n", release.ID, release.Path, release.ManifestPath)
+	if _, err := fmt.Fprintf(stdout, "release_id: %s\nrelease_path: %s\nmanifest: %s\n", release.ID, release.Path, release.ManifestPath); err != nil {
+		return err
+	}
+	if strings.TrimSpace(release.ArchivePath) != "" {
+		_, err = fmt.Fprintf(stdout, "archive: %s\n", release.ArchivePath)
+		return err
+	}
 	return err
 }
 
@@ -220,6 +229,9 @@ func runPush(ctx context.Context, args []string, stdout io.Writer, env []string,
 	if err != nil {
 		return err
 	}
+	renderer := newProgressRenderer(stdout)
+	service.SetProgressReporter(renderer.Handle)
+	defer renderer.Finish()
 
 	result, err := service.Push(ctx, *releaseID, *skipActivate)
 	if err != nil {
@@ -516,6 +528,86 @@ func boolLabel(value bool) string {
 		return "ok"
 	}
 	return "missing"
+}
+
+type progressRenderer struct {
+	writer      io.Writer
+	uploadAlive bool
+	lastLineLen int
+}
+
+func newProgressRenderer(writer io.Writer) *progressRenderer {
+	return &progressRenderer{writer: writer}
+}
+
+func (r *progressRenderer) Handle(event app.ProgressEvent) {
+	if event.Phase == "upload" && event.Total > 0 {
+		r.renderUpload(event)
+		return
+	}
+	r.flushUploadLine()
+	if strings.TrimSpace(event.Message) == "" {
+		return
+	}
+	if event.Path != "" && (event.Phase == "build" || event.Phase == "verify") {
+		_, _ = fmt.Fprintf(r.writer, "-> %s: %s\n", event.Message, event.Path)
+		return
+	}
+	_, _ = fmt.Fprintf(r.writer, "-> %s\n", event.Message)
+}
+
+func (r *progressRenderer) renderUpload(event app.ProgressEvent) {
+	percent := 0
+	if event.TotalBytes > 0 {
+		percent = int((event.CompletedBytes * 100) / event.TotalBytes)
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	line := fmt.Sprintf("\r%s %3d%% %d/%d %s", renderBar(percent, 24), percent, event.Current, event.Total, shortenProgressPath(event.Path, 70))
+	padding := ""
+	if len(line) < r.lastLineLen {
+		padding = strings.Repeat(" ", r.lastLineLen-len(line))
+	}
+	_, _ = fmt.Fprintf(r.writer, "%s%s", line, padding)
+	r.lastLineLen = len(line)
+	r.uploadAlive = true
+	if event.Current == event.Total {
+		r.flushUploadLine()
+		_, _ = fmt.Fprintln(r.writer, "-> upload concluido")
+	}
+}
+
+func (r *progressRenderer) flushUploadLine() {
+	if !r.uploadAlive {
+		return
+	}
+	_, _ = fmt.Fprint(r.writer, "\n")
+	r.uploadAlive = false
+	r.lastLineLen = 0
+}
+
+func (r *progressRenderer) Finish() {
+	r.flushUploadLine()
+}
+
+func renderBar(percent int, width int) string {
+	if width < 4 {
+		width = 4
+	}
+	filled := (percent * width) / 100
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
+}
+
+func shortenProgressPath(value string, max int) string {
+	trimmed := strings.TrimSpace(value)
+	if max < 8 || len(trimmed) <= max {
+		return trimmed
+	}
+	return "..." + trimmed[len(trimmed)-max+3:]
 }
 
 func doctorExtraNotes(check app.DoctorCheck) []string {

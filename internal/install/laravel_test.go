@@ -100,6 +100,9 @@ func TestInitLocawebCreatesDeployConfigFiles(t *testing.T) {
 	if !strings.Contains(deployYAML, `protocol: "ftps"`) {
 		t.Fatalf("expected deploy.yml to target ftps")
 	}
+	if !strings.Contains(deployYAML, `upload_mode: "archive"`) {
+		t.Fatalf("expected deploy.yml to enable archive uploads")
+	}
 	if !strings.Contains(deployYAML, `public_root: "/public_html"`) {
 		t.Fatalf("expected deploy.yml to contain transport public_html path")
 	}
@@ -113,6 +116,9 @@ func TestInitLocawebCreatesDeployConfigFiles(t *testing.T) {
 	}
 	if !strings.Contains(deployEnv, "DEPLOY_REMOTE_APP_ROOT=/app") || !strings.Contains(deployEnv, "DEPLOY_RUNTIME_APP_ROOT=/home/myftpuser/app") {
 		t.Fatalf("expected deploy env example to separate transport and runtime paths")
+	}
+	if !strings.Contains(deployEnv, "DEPLOY_HOOK_TIMEOUT=10m") {
+		t.Fatalf("expected deploy env example to include hook timeout")
 	}
 
 	indexExample := mustRead(t, filepath.Join(projectRoot, "docs", "deploypier-public-index.php.example"))
